@@ -84,3 +84,7 @@ The automated suite uses synthetic data and a temporary SQLite directory. It doe
 ## Repository privacy
 
 Local SQLite state, exported attachments, Codex automation memory, generated reports, and build products are ignored and must never be committed. See [SECURITY.md](SECURITY.md).
+
+## License
+
+Released under the [MIT License](LICENSE).
