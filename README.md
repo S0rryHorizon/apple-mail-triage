@@ -2,6 +2,8 @@
 
 A local macOS bridge and Codex skill for privacy-minimized Apple Mail triage. MailBridge exposes a narrow JSON stdin/stdout API; `email-triage` classifies sanitized messages, produces Chinese reports, extracts reviewable task/calendar candidates, and applies only explicitly enabled, reversible flags.
 
+**[中文下载与使用说明](docs/使用说明.md)** · [Latest release](https://github.com/S0rryHorizon/apple-mail-triage/releases/latest)
+
 ## Safety model
 
 - Uses Apple Mail's automation interface—never its private database or account passwords.

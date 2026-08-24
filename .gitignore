@@ -11,4 +11,5 @@ memory.md
 *.sqlite-wal
 MailTriage/
 exports/
+dist/
 *.xcresult
