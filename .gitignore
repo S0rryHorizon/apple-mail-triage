@@ -1,0 +1,14 @@
+.build/
+.swiftpm/
+.DS_Store
+.env
+.env.*
+!.env.example
+.codex/
+memory.md
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+MailTriage/
+exports/
+*.xcresult

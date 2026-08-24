@@ -1,0 +1,6 @@
+interface:
+  display_name: "Apple 邮件整理"
+  short_description: "安全整理 Apple 邮件、待办与日程候选"
+  default_prompt: "Use $email-triage to scan new Apple Mail messages and produce the Chinese morning/evening triage report."
+policy:
+  allow_implicit_invocation: true
