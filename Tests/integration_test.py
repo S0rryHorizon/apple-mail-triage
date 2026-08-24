@@ -7,14 +7,27 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BINARY = ROOT / ".build" / "debug" / "MailBridge"
+
+
+def bridge_binary():
+    override = os.environ.get("MAILBRIDGE_TEST_BINARY")
+    candidates = [
+        pathlib.Path(override) if override else None,
+        ROOT / ".build" / "debug" / "MailBridge",
+        ROOT / ".build" / "release" / "MailBridge",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "MailBridge test binary not found; run 'swift build' or 'swift build -c release'.")
 
 
 def request(payload, state_dir):
     env = os.environ.copy()
     env["MAIL_TRIAGE_STATE_DIR"] = state_dir
     result = subprocess.run(
-        [str(BINARY)],
+        [str(bridge_binary())],
         input=json.dumps(payload, ensure_ascii=False),
         text=True,
         capture_output=True,
