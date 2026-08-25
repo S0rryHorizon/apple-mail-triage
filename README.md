@@ -65,7 +65,7 @@ Install this directory as a saved local Codex project. The recommended standalon
 邮箱整理｜2026-W35｜08.24–08.30
 ```
 
-Keep the current and previous weekly tasks visible and archive only older managed weekly tasks. Manual discussions and candidate-confirmation tasks are never auto-archived. If the exact weekly title appears with missing or mismatched project metadata, the dispatcher stops and remains visible instead of creating a duplicate. A successful empty scan adds one compact receipt; new messages or errors produce the complete report. See [the portable dispatcher template](automation/weekly-dispatcher.md).
+Keep the current and previous weekly tasks visible and archive only older managed weekly tasks. Manual discussions and candidate-confirmation tasks are never auto-archived. The local dispatcher keeps a permission-restricted weekly-thread index outside the repository, so migrated or delegated threads with incomplete App project metadata can still be continued by their verified stable ID; an unknown exact-title collision still stops the dispatcher instead of creating a duplicate. A successful empty scan adds one compact receipt; new messages or errors produce the complete report. See [the portable dispatcher template](automation/weekly-dispatcher.md).
 
 Scheduled runs require the Mac to be awake, Codex desktop to be available, and this project path to remain accessible. Delayed runs catch up from the last successful cursor and remain assigned to the ISO week of their planned slot.
 
