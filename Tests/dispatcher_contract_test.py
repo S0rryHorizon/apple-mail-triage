@@ -26,7 +26,7 @@ class DispatcherContractTests(unittest.TestCase):
 
     def test_app_tool_order_is_documented(self):
         self.assertIn(
-            "For a registry-owned target use `read_thread` → one delivery call. For discovery use `list_threads` → `list_archived_threads` →, only when creating, `list_projects` → registry update → one delivery call → cleanup calls → `set_thread_archived`",
+            "For a registry-owned target use `read_thread` → one delivery call. For discovery use `list_threads` → `list_archived_threads` →, only when creating, `list_projects` → `create_thread` with the complete triage prompt → registry update → cleanup calls → `set_thread_archived`",
             self.prompt,
         )
 
