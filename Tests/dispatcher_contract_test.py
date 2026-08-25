@@ -34,6 +34,18 @@ class DispatcherContractTests(unittest.TestCase):
         self.assertIn("stop the dispatcher, leave it visible, and report the failed stage", self.prompt)
         self.assertIn("Never fall back to triaging mail here.", self.prompt)
 
+    def test_exact_title_collision_guard_blocks_false_creation(self):
+        required_phrases = (
+            "read-only exact-title collision check",
+            "session index",
+            "If an exact managed title is present in the index but is absent from the App listings",
+            "Do not create, send, rename, archive, or infer ownership",
+            "neither App listings nor the collision check contains the exact title",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
