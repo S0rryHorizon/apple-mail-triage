@@ -34,6 +34,10 @@ class DispatcherContractTests(unittest.TestCase):
         self.assertIn("stop the dispatcher, leave it visible, and report the failed stage", self.prompt)
         self.assertIn("Never fall back to triaging mail here.", self.prompt)
 
+    def test_weekly_target_outputs_directly(self):
+        self.assertIn("The target task is already the weekly conversation", self.prompt)
+        self.assertIn("never call send_message_to_thread, create_thread, set_thread_archived", self.prompt)
+
     def test_exact_title_collision_guard_blocks_false_creation(self):
         required_phrases = (
             "read-only exact-title collision check",
