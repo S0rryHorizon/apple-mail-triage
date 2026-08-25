@@ -42,7 +42,9 @@ class DispatcherContractTests(unittest.TestCase):
         required_phrases = (
             "read-only exact-title collision check",
             "session index",
-            "If an exact managed title is present in the index but is absent from the App listings",
+            "index is append-only",
+            "use only its latest JSON record",
+            "If a current exact managed title is present in the index but is absent from the App listings",
             "Do not create, send, rename, archive, or infer ownership of an unknown task",
             "neither the App listings nor the collision check contains the exact title",
         )
