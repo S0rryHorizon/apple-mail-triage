@@ -79,6 +79,7 @@ Email triage only creates stable candidates. The user must confirm candidate IDs
 swift build
 swift run MailBridgeSelfTest
 python3 -m unittest Tests/integration_test.py
+python3 -m unittest Tests/dispatcher_contract_test.py
 ```
 
 The automated suite uses synthetic data and a temporary SQLite directory. It does not open Apple Mail. Live Apple Mail permission and read-only smoke tests remain manual by design.

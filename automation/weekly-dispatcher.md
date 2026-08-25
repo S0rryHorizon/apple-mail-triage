@@ -21,6 +21,15 @@ Use Asia/Singapore. Resolve the planned scheduler slot before doing anything els
 
 The email project ID is {{EMAIL_PROJECT_ID}}. A managed weekly title has exactly this form: 邮箱整理｜YYYY-Www｜MM.DD–MM.DD, Monday through Sunday.
 
+### Tool-call safety (mandatory)
+
+The Codex App thread and project tools are renderer-backed. Treat them as a serialized critical section:
+
+- Call at most one of `list_threads`, `list_archived_threads`, `list_projects`, `send_message_to_thread`, `create_thread`, or `set_thread_archived` at a time. Wait for its complete result before starting the next call.
+- Never put these calls in `Promise.all`, parallel JavaScript, multi-agent work, or any other parallel wrapper. If the host exposes them through `functions.exec`, invoke exactly one App tool inside the wrapper and wait for completion before invoking the next one.
+- Use this order: `list_threads` → `list_archived_threads` →, only when creating, `list_projects` → one delivery call → fresh sequential cleanup listings → cleanup calls → `set_thread_archived`.
+- If an App tool call does not return, stop the dispatcher, leave it visible, and report the failed stage. Do not issue another App call or start a retry while the previous call is pending. Retry an explicit transient error at most once, and only after the previous call has returned; a timeout or no-result is not an explicit transient error.
+
 1. List active tasks and check archived tasks when available. Match only Codex tasks whose project ID and exact managed title agree. Treat duplicate or ambiguous matches as an error; do not guess, deliver, create, or archive anything.
 2. Continue the unique current-week task with send_message_to_thread. If it does not exist and there is no archived same-title task, create it in the saved project with the local environment. Use {{MODEL}} with reasoning {{REASONING}}.
 3. Deliver a prompt that explicitly invokes $email-triage and includes the planned slot, actual start, exact weekly title, frozen-window pagination, cross-page fingerprint deduplication, cursor catch-up, privacy and attachment limits, candidate IDs, flag policy, and CalendarBridge boundaries. Preserve the repository skill's hard boundaries.
