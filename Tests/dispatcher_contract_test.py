@@ -26,7 +26,7 @@ class DispatcherContractTests(unittest.TestCase):
 
     def test_app_tool_order_is_documented(self):
         self.assertIn(
-            "For a registry-owned target use local registry validation → one `send_message_to_thread` call. Use `read_thread` only in the recovery/discovery path after a direct delivery explicitly reports a missing or stale ID. For discovery use `list_threads` → `list_archived_threads` →, only when creating, `list_projects` → `create_thread` with the complete triage prompt → registry update → cleanup calls → `set_thread_archived`",
+            "For a registry-owned target use local registry validation → one `send_message_to_thread` call. Use `read_thread` only in the recovery/discovery path after a direct delivery explicitly reports a missing or stale ID. After a successful delivery, a separate serialized `list_threads` cleanup pass may identify stale dispatcher tasks; never use that pass to validate or rediscover the weekly target. For discovery use `list_threads` → `list_archived_threads` →, only when creating, `list_projects` → `create_thread` with the complete triage prompt → registry update → cleanup calls → `set_thread_archived`",
             self.prompt,
         )
 
@@ -47,6 +47,21 @@ class DispatcherContractTests(unittest.TestCase):
             "If the registry entry is absent or `send_message_to_thread` explicitly reports that the ID no longer exists",
             self.prompt,
         )
+
+    def test_successful_delivery_cleans_only_stale_dispatchers(self):
+        required_phrases = (
+            "After a successful delivery, a separate serialized `list_threads` cleanup pass may identify stale dispatcher tasks",
+            "Once delivery to the weekly task succeeds (including a first-week `create_thread`), run one serialized `list_threads` cleanup pass",
+            "title exactly `Apple 邮件周对话分发器`",
+            "status exactly `idle`",
+            "a literal `Automation ID: apple` marker in the summary",
+            "updatedAt` earlier than this dispatcher's actual start time",
+            "Do not archive the current dispatcher, active tasks, records with missing/mismatched metadata, or any manual discussion",
+            "if the list or an archive call has no result or an explicit error, stop cleanup without retrying",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.prompt)
 
     def test_failure_boundary_preserves_dispatcher(self):
         self.assertIn("stop the dispatcher, leave it visible, and report the failed stage", self.prompt)
