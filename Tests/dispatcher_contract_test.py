@@ -43,6 +43,10 @@ class DispatcherContractTests(unittest.TestCase):
             "if it returns no result, stop and leave the dispatcher visible",
             self.prompt,
         )
+        self.assertIn(
+            "If the registry entry is absent or `send_message_to_thread` explicitly reports that the ID no longer exists",
+            self.prompt,
+        )
 
     def test_failure_boundary_preserves_dispatcher(self):
         self.assertIn("stop the dispatcher, leave it visible, and report the failed stage", self.prompt)
