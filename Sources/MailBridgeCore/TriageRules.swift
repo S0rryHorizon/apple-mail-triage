@@ -42,14 +42,66 @@ public enum TriageRules {
     }
   }
 
+  public static let maximumAttachmentSize: Int64 = 10 * 1024 * 1024
+  public static let maximumTotalAttachmentSize: Int64 = 20 * 1024 * 1024
+  private static let attachmentMIMEs = [
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "pdf": "application/pdf", "csv": "text/csv", "tsv": "text/tab-separated-values",
+    "txt": "text/plain", "md": "text/markdown",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ]
+
+  public static func attachmentDecision(name: String, mimeType: String, size: Int64) -> AttachmentDecision {
+    let ext = (name as NSString).pathExtension.lowercased()
+    let raw = mimeType.trimmingCharacters(in: .whitespacesAndNewlines)
+    let mime = raw.components(separatedBy: ";")[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let denied = ["zip", "rar", "7z", "dmg", "pkg", "app", "exe", "js", "command", "sh", "docm", "xlsm"]
+    if denied.contains(ext) { return .rejected(.deniedExtension) }
+    guard let expected = attachmentMIMEs[ext] else {
+      return .rejected(raw.isEmpty ? .emptyMimeAndUnknownExtension : .unknownExtension)
+    }
+    guard size >= 0 else { return .rejected(.invalidSize) }
+    guard size <= maximumAttachmentSize else { return .rejected(.fileTooLarge) }
+    if raw.isEmpty { return .allowed(mimeType: expected, inferred: true) }
+    guard mime == expected else { return .rejected(.mimeExtensionMismatch) }
+    return .allowed(mimeType: expected, inferred: false)
+  }
+
+  public static func attachmentTotalRejection(sizes: [Int64]) -> AttachmentRejectionReason? {
+    var total: Int64 = 0
+    for size in sizes {
+      guard size >= 0 else { return .invalidSize }
+      guard size <= maximumTotalAttachmentSize - total else { return .totalSizeTooLarge }
+      total += size
+    }
+    return nil
+  }
+
   public static func attachmentAllowed(name: String, mimeType: String, size: Int64) -> Bool {
-    guard size >= 0 && size <= 10 * 1024 * 1024 else { return false }
-    let lowerName = name.lowercased()
-    let denied = [".zip", ".rar", ".7z", ".dmg", ".pkg", ".app", ".exe", ".js", ".command", ".sh", ".docm", ".xlsm"]
-    if denied.contains(where: lowerName.hasSuffix) { return false }
-    let extensions = [".pdf", ".png", ".jpg", ".jpeg", ".heic", ".webp", ".txt", ".md", ".html", ".htm", ".docx", ".xlsx", ".csv", ".tsv"]
-    let mimes = ["application/pdf", "text/", "image/", "application/vnd.openxmlformats-officedocument"]
-    return extensions.contains(where: lowerName.hasSuffix)
-      && mimes.contains(where: mimeType.lowercased().hasPrefix)
+    if case .allowed = attachmentDecision(name: name, mimeType: mimeType, size: size) { return true }
+    return false
+  }
+}
+
+public enum AttachmentDecision: Equatable, Sendable {
+  case allowed(mimeType: String, inferred: Bool)
+  case rejected(AttachmentRejectionReason)
+}
+
+public enum AttachmentRejectionReason: String, Sendable {
+  case emptyMimeAndUnknownExtension, mimeExtensionMismatch, deniedExtension, unknownExtension
+  case invalidSize, fileTooLarge, totalSizeTooLarge
+
+  public var message: String {
+    switch self {
+    case .emptyMimeAndUnknownExtension: return "MIME 为空且扩展名无法安全推断。"
+    case .mimeExtensionMismatch: return "MIME 与扩展名冲突。"
+    case .deniedExtension: return "危险扩展名。"
+    case .unknownExtension: return "扩展名不在安全白名单内。"
+    case .invalidSize: return "附件大小无效。"
+    case .fileTooLarge: return "单文件超过 10 MB。"
+    case .totalSizeTooLarge: return "邮件附件合计超过 20 MB。"
+    }
   }
 }

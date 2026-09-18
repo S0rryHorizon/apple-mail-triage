@@ -45,7 +45,6 @@ final class MailAutomation {
             set skipped to skipped + 1
           else
           if emitted is greater than or equal to \(safeLimit) then exit repeat
-          try
             set boxRef to mailbox of msg
             set acctRef to account of boxRef
             set rfcId to ""
@@ -53,17 +52,13 @@ final class MailAutomation {
               set rfcId to message id of msg as text
             end try
             set bodyText to ""
-            try
+            if \(max(previewCharacters, 0)) is greater than 0 then
               set bodyText to content of msg as text
-            end try
+            end if
             set ageSeconds to nowDate - (date received of msg)
-            set attachmentTotal to 0
-            try
-              set attachmentTotal to count of mail attachments of msg
-            end try
+            set attachmentTotal to count of mail attachments of msg
             set end of output to {(id of acctRef as text), (name of acctRef as text), (name of boxRef as text), (id of msg as integer), rfcId, ageSeconds, (sender of msg as text), (subject of msg as text), (read status of msg as boolean), (flag index of msg as integer), attachmentTotal, bodyText}
             set emitted to emitted + 1
-          end try
           end if
         end repeat
         return output
@@ -71,12 +66,20 @@ final class MailAutomation {
       """)
     let now = Date()
     var result: [MailMessage] = []
-    for item in descriptor.listItems {
+    for index in 0..<descriptor.numberOfItems {
+      guard let item = descriptor.atIndex(index + 1), item.numberOfItems == 12 else {
+        throw MailBridgeError.mailAutomation("扫描结果格式错误；此页不能推进游标。")
+      }
       let accountId = item.string(at: 1)
       let libraryId = item.int64(at: 4)
-      guard !accountId.isEmpty, libraryId > 0 else { continue }
+      guard !accountId.isEmpty, libraryId > 0,
+        let ageDescriptor = item.atIndex(6),
+        let age = ageDescriptor.stringValue.flatMap(Double.init), age.isFinite
+      else {
+        throw MailBridgeError.mailAutomation("扫描结果缺少有效邮件标识或接收时间；此页不能推进游标。")
+      }
       let messageId = item.optionalString(at: 5)
-      let receivedAt = DateCodec.string(now.addingTimeInterval(-item.double(at: 6)))
+      let receivedAt = DateCodec.string(now.addingTimeInterval(-age))
       let sender = PrivacyFilter.sanitize(item.string(at: 7), limit: 500)
       let subject = PrivacyFilter.sanitize(item.string(at: 8), limit: 1_000)
       let text = PrivacyFilter.sanitize(item.string(at: 12), limit: previewCharacters)
@@ -104,7 +107,7 @@ final class MailAutomation {
         hint: TriageRules.hint(sender: sender, subject: subject, text: text)
       ))
     }
-    return result.sorted { $0.receivedAt > $1.receivedAt }
+    return result
   }
 
   func read(ref: MessageRef, maxCharacters: Int) throws -> MailMessage {
