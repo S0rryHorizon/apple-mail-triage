@@ -21,8 +21,9 @@ final class MailBridgeTests {
     }
     XCTAssertEqual(TriageRules.attachmentDecision(name: "file.png", mimeType: "", size: 10*1024*1024+1), .rejected(.fileTooLarge))
     XCTAssertTrue(TriageRules.attachmentAllowed(name: "file.png", mimeType: "", size: 10*1024*1024))
-    XCTAssertEqual(TriageRules.attachmentTotalRejection(sizes: [10*1024*1024,10*1024*1024,1]), .totalSizeTooLarge)
-    XCTAssertNil(TriageRules.attachmentTotalRejection(sizes: [10*1024*1024,10*1024*1024]))
+    let tenMiB: Int64 = 10 * 1024 * 1024
+    XCTAssertEqual(TriageRules.attachmentTotalRejection(sizes: [tenMiB, tenMiB, 1]), .totalSizeTooLarge)
+    XCTAssertNil(TriageRules.attachmentTotalRejection(sizes: [tenMiB, tenMiB]))
     XCTAssertEqual(TriageRules.attachmentTotalRejection(sizes: [Int64.max, 1]), .totalSizeTooLarge)
     XCTAssertEqual(TriageRules.attachmentTotalRejection(sizes: [-1]), .invalidSize)
   }
