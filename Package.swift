@@ -11,11 +11,21 @@ let package = Package(
   ],
   targets: [
     .target(name: "MailBridgeCore"),
-    .executableTarget(
-      name: "MailBridge",
+    .target(
+      name: "MailBridgeRuntime",
       dependencies: ["MailBridgeCore"],
       linkerSettings: [.linkedLibrary("sqlite3")]
     ),
+    .executableTarget(name: "MailBridge", dependencies: ["MailBridgeRuntime", "MailBridgeCore"]),
     .executableTarget(name: "MailBridgeSelfTest", dependencies: ["MailBridgeCore"]),
+    .executableTarget(
+      name: "MailBridgeSyntheticDemo",
+      dependencies: ["MailBridgeRuntime", "MailBridgeCore"]
+    ),
+    .executableTarget(
+      name: "MailBridgeSyntheticTests",
+      dependencies: ["MailBridgeRuntime", "MailBridgeCore"],
+      path: "Tests/Swift"
+    ),
   ]
 )

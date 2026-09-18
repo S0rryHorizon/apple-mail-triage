@@ -1,15 +1,14 @@
 # Report contract
 
-Write in Chinese while preserving original sender names, subjects, and proper nouns. Use this fixed order:
+Write in Chinese, preserving original sender names and meaningful subjects/proper nouns. Lead with required actions, important changes, and exceptions. Omit empty sections.
 
-1. **高风险核查** — concise reason and safe next step; no codes, card suffixes, or sensitive links.
-2. **候选日程与待办** — stable ID, kind, title, effective date/time, source account/subject, and missing fields. Tell the user they can confirm IDs.
-3. **重要信息摘要** — one or two Chinese sentences per useful non-action message.
-4. **广告、验证码与普通通知** — one compact line per message with sender and original subject. For a code say only “收到验证码”.
-5. **运行统计** — planned schedule slot, actual start time, delay, frozen scan window, backlog page count, per-account counts, category totals, skipped duplicates, attachment failures, account errors, flag preview/commit results, and next rollout step.
+- Important messages normally need 2–4 sentences: specific experiment/meeting/course/task name, what it concerns, date/time/place, and required action or deadline. Combine related messages around the latest supported arrangement; do not mistake quoted older text for a new instruction. Preserve source account and subject for traceability.
+- For relevant missing fields, say “原文未提供”; if unreadable, say “未能读取，待核查”. Do not invent details or treat a failed/truncated read as proof that a message is unimportant. Read necessary body/approved attachments before summarizing; summarize rather than pasting raw text.
+- Show calendar/reminder candidates with their stable IDs and missing required fields, and invite confirmation of concrete candidates. Avoid repeating the same content in a separate summary. Never create calendar items automatically.
+- Describe security concerns with a concrete reason and next step. Never repeat codes, tokens, sensitive links or card suffixes.
+- Routine advertising, codes and low-value notices need no individual report unless requested. Do not archive, delete or change read state.
+- Hide normal scan counts, skipped duplicates, cursor progress, scheduling delay and shadow flag results. Show operational details only on explicit request or when they explain a material exception. Preserve real flag batch IDs internally for rollback; current scheduled runs remain flag.preview only.
+- If there is no worthwhile new information and no exception, produce no appended report or empty-scan receipt. Silent output does not skip classification or successful state.record; an incomplete/failed run must still be reported and must not advance affected cursors.
+- For partial failures, state what completed, what remains unread/unprocessed, and the next step. Do not claim a clean inbox or successful completion from an uncertain result.
 
-Do not write a local Markdown report. Do not include the sanitized body verbatim when a summary is sufficient.
-
-During shadow mode, say which messages *would* receive orange/red flags and leave Mail unchanged. After real flagging is enabled, include the returned flag `batchId` for rollback.
-
-For a delayed run, explicitly say that it is catching up from the last successful cursor. If paging or an account fails, label the report partial and do not claim that the backlog was cleared.
+Do not write a local Markdown report or persist raw bodies/attachments. The quiet rule governs normal triage output, not a direct user request for diagnostics or test results.

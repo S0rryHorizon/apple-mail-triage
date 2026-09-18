@@ -1,5 +1,6 @@
 import Foundation
 import MailBridgeCore
+import MailBridgeRuntime
 
 private func inputData() throws -> Data {
   let arguments = CommandLine.arguments

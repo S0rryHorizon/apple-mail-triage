@@ -61,6 +61,9 @@ public struct AttachmentInfo: Codable, Equatable, Sendable {
   public var name: String
   public var mimeType: String
   public var size: Int64
+  public var effectiveMimeType: String?
+  public var mimeInferred: Bool?
+  public var rejectionReason: String?
   public var downloaded: Bool
 
   public init(id: String, name: String, mimeType: String, size: Int64, downloaded: Bool) {
@@ -69,6 +72,12 @@ public struct AttachmentInfo: Codable, Equatable, Sendable {
     self.mimeType = mimeType
     self.size = size
     self.downloaded = downloaded
+    switch TriageRules.attachmentDecision(name: name, mimeType: mimeType, size: size) {
+    case .allowed(let mime, let inferred):
+      effectiveMimeType = mime
+      mimeInferred = inferred
+    case .rejected(let reason): rejectionReason = reason.rawValue
+    }
   }
 }
 
@@ -255,6 +264,7 @@ public struct BridgeRequest: Codable, Sendable {
   public var batchId: String?
   public var flags: [FlagInstruction]?
   public var state: StateUpdate?
+  public var accountIds: [String]?
   public var candidateIds: [String]?
   public var candidateStatus: String?
   public var rule: ExplicitRule?

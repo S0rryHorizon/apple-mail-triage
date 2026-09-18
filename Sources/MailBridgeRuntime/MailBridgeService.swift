@@ -1,16 +1,33 @@
 import Foundation
 import MailBridgeCore
 
-final class MailBridgeService {
+public final class MailBridgeService {
   private let automation: MailAutomation
   private let store: StateStore
+  private let accountProvider: () throws -> [MailAccount]
+  private let scanProvider: (Date, Date, Int, Int, Int) throws -> [MailMessage]
 
-  init() throws {
-    automation = MailAutomation()
+  public init() throws {
+    let mail = MailAutomation()
+    automation = mail
     store = try StateStore()
+    accountProvider = { try mail.accounts() }
+    scanProvider = { try mail.scan(since: $0, until: $1, offset: $2, limit: $3, previewCharacters: $4) }
   }
 
-  func handle(_ request: BridgeRequest) throws -> BridgeResponse {
+  package init(
+    store: StateStore,
+    accountProvider: @escaping () throws -> [MailAccount],
+    scanProvider: ((Date, Date, Int, Int, Int) throws -> [MailMessage])? = nil
+  ) {
+    let mail = MailAutomation()
+    automation = mail
+    self.store = store
+    self.accountProvider = accountProvider
+    self.scanProvider = scanProvider ?? { try mail.scan(since: $0, until: $1, offset: $2, limit: $3, previewCharacters: $4) }
+  }
+
+  public func handle(_ request: BridgeRequest) throws -> BridgeResponse {
     switch request.action {
     case "setup": return try status(request, setup: true)
     case "status": return try status(request, setup: false)
@@ -23,6 +40,7 @@ final class MailBridgeService {
     case "flag.rollback": return try rollbackFlags(request)
     case "state.status": return try stateStatus(request)
     case "state.record": return try recordState(request)
+    case "state.repair": return try repairState(request)
     case "state.pending": return try pendingCandidates(request)
     case "candidate.resolve": return try resolveCandidates(request)
     case "rule.list": return try listRules(request)
@@ -76,14 +94,11 @@ final class MailBridgeService {
     }
     let offset = max(request.offset ?? 0, 0)
     let limit = min(max(request.limit ?? 200, 1), 1_000)
+    guard offset <= Int.max - limit else {
+      throw MailBridgeError.invalidRequest("offset 过大。")
+    }
     let preview = min(max(request.previewCharacters ?? 800, 0), 4_000)
-    let scanned = try automation.scan(
-      since: since,
-      until: until,
-      offset: offset,
-      limit: limit + 1,
-      previewCharacters: preview
-    )
+    let scanned = try scanProvider(since, until, offset, limit + 1, preview)
     let hasMore = scanned.count > limit
     let page = Array(scanned.prefix(limit))
     var messages: [MailMessage] = []
@@ -96,7 +111,11 @@ final class MailBridgeService {
       }
     }
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
-    response.messages = messages
+    response.messages = messages.sorted {
+      if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
+      if $0.ref.accountId != $1.ref.accountId { return $0.ref.accountId < $1.ref.accountId }
+      return $0.ref.libraryId < $1.ref.libraryId
+    }
     response.state = state
     response.details = [
       "since": DateCodec.string(since),
@@ -126,16 +145,18 @@ final class MailBridgeService {
     }
     let message = try automation.read(ref: ref, maxCharacters: 0)
     let attachments = message.attachments ?? []
-    guard attachments.reduce(Int64(0), { $0 + max($1.size, 0) }) <= 20 * 1024 * 1024 else {
-      throw MailBridgeError.attachmentRejected("该邮件附件合计超过 20 MB。")
+    if let reason = TriageRules.attachmentTotalRejection(sizes: attachments.map(\.size)) {
+      throw MailBridgeError.attachmentRejected("\(reason.rawValue): \(reason.message)")
     }
     guard let attachment = attachments.first(where: { $0.id == attachmentId }) else {
       throw MailBridgeError.notFound("找不到指定附件。")
     }
-    guard TriageRules.attachmentAllowed(
-      name: attachment.name, mimeType: attachment.mimeType, size: attachment.size
-    ) else {
-      throw MailBridgeError.attachmentRejected("附件类型或大小不在安全白名单内：\(attachment.name)")
+    let mime: String
+    let inferred: Bool
+    switch TriageRules.attachmentDecision(name: attachment.name, mimeType: attachment.mimeType, size: attachment.size) {
+    case .allowed(let effective, let fallback): mime = effective; inferred = fallback
+    case .rejected(let reason):
+      throw MailBridgeError.attachmentRejected("\(reason.rawValue): \(reason.message)")
     }
     let base = FileManager.default.temporaryDirectory
       .appendingPathComponent("MailTriage", isDirectory: true)
@@ -143,14 +164,21 @@ final class MailBridgeService {
     try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     let fileName = sanitizedFileName(attachment.name)
     let output = base.appendingPathComponent(fileName)
-    try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
-    let token = try store.registerExport(path: base.path)
+    let token: String
+    do {
+      try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
+      token = try store.registerExport(path: base.path)
+    } catch {
+      try? FileManager.default.removeItem(at: base)
+      throw error
+    }
     var response = BridgeResponse(ok: true, status: "exported", requestId: request.requestId)
+    response.details = ["mimeInferred": String(inferred), "mimeDiagnostic": inferred ? "MIME 为空，已根据安全扩展名推断。" : "MIME 与扩展名匹配。"]
     response.attachment = ExportedAttachment(
       path: output.path,
       cleanupToken: token,
       name: attachment.name,
-      mimeType: attachment.mimeType,
+      mimeType: mime,
       size: attachment.size
     )
     return response
@@ -344,8 +372,22 @@ final class MailBridgeService {
     if update.flaggingEnabled == true && request.confirmed != true {
       throw MailBridgeError.confirmationRequired("启用真实旗标需要 confirmed: true。")
     }
-    try store.record(update)
+    try store.record(update, enabledAccountIds: Set(try accountProvider().filter(\.enabled).map(\.id)))
     var response = BridgeResponse(ok: true, status: "recorded", requestId: request.requestId)
+    response.state = try store.summary()
+    return response
+  }
+
+  private func repairState(_ request: BridgeRequest) throws -> BridgeResponse {
+    guard request.confirmed == true else {
+      throw MailBridgeError.confirmationRequired("state.repair 需要 confirmed: true。")
+    }
+    guard let ids = request.accountIds, !ids.isEmpty else {
+      throw MailBridgeError.invalidRequest("state.repair 需要非空 accountIds。")
+    }
+    // Disabled accounts still exist and their cursors must be preserved.
+    try store.removeOrphanCursors(ids: ids, knownAccountIds: Set(try accountProvider().map(\.id)))
+    var response = BridgeResponse(ok: true, status: "repaired", requestId: request.requestId)
     response.state = try store.summary()
     return response
   }
