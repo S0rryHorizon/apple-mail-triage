@@ -12,7 +12,9 @@ public final class MailBridgeService {
     automation = mail
     store = try StateStore()
     accountProvider = { try mail.accounts() }
-    scanProvider = { try mail.scan(since: $0, until: $1, offset: $2, limit: $3, previewCharacters: $4) }
+    scanProvider = { since, until, offset, limit, _ in
+      try mail.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
   }
 
   package init(
@@ -24,14 +26,25 @@ public final class MailBridgeService {
     automation = mail
     self.store = store
     self.accountProvider = accountProvider
-    self.scanProvider = scanProvider ?? { try mail.scan(since: $0, until: $1, offset: $2, limit: $3, previewCharacters: $4) }
+    self.scanProvider = scanProvider ?? { since, until, offset, limit, _ in
+      try mail.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
+  }
+
+  init(automation: MailAutomation, store: StateStore) {
+    self.automation = automation
+    self.store = store
+    self.accountProvider = { try automation.accounts() }
+    self.scanProvider = { since, until, offset, limit, _ in
+      try automation.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
   }
 
   public func handle(_ request: BridgeRequest) throws -> BridgeResponse {
     switch request.action {
     case "setup": return try status(request, setup: true)
     case "status": return try status(request, setup: false)
-    case "message.scan": return try scan(request)
+    case "message.scan": return try automation.withReadDeadline { try scan(request) }
     case "message.read": return try read(request)
     case "attachment.export": return try exportAttachment(request)
     case "attachment.cleanup": return try cleanupAttachment(request)
@@ -69,16 +82,19 @@ public final class MailBridgeService {
 
   private func scan(_ request: BridgeRequest) throws -> BridgeResponse {
     let state = try store.summary()
+    let enabledAccountIds = Set(try accountProvider().filter(\.enabled).map(\.id))
     let since: Date
     if let value = request.since {
       guard let parsed = DateCodec.date(value) else {
         throw MailBridgeError.invalidRequest("since 必须是 ISO 8601 时间。")
       }
       since = parsed
-    } else if let earliest = state.cursors.compactMap({ DateCodec.date($0.receivedAt) }).min() {
-      since = earliest.addingTimeInterval(-15 * 60)
     } else {
-      since = Date().addingTimeInterval(-24 * 60 * 60)
+      let firstRunSince = Date().addingTimeInterval(-24 * 60 * 60)
+      let cursors = Dictionary(uniqueKeysWithValues: state.cursors.map { ($0.accountId, $0.receivedAt) })
+      since = enabledAccountIds.map { accountId in
+        cursors[accountId].flatMap(DateCodec.date)?.addingTimeInterval(-15 * 60) ?? firstRunSince
+      }.min() ?? firstRunSince
     }
     let until: Date
     if let value = request.until {
@@ -98,15 +114,19 @@ public final class MailBridgeService {
       throw MailBridgeError.invalidRequest("offset 过大。")
     }
     let preview = min(max(request.previewCharacters ?? 800, 0), 4_000)
-    let scanned = try scanProvider(since, until, offset, limit + 1, preview)
+    let scanned = try scanProvider(since, until, offset, limit + 1, 0)
     let hasMore = scanned.count > limit
     let page = Array(scanned.prefix(limit))
     var messages: [MailMessage] = []
     var seenFingerprints = Set<String>()
-    for message in page {
-      if seenFingerprints.insert(message.fingerprint).inserted,
+    for var message in page {
+      if enabledAccountIds.contains(message.ref.accountId),
+        seenFingerprints.insert(message.fingerprint).inserted,
         try !store.isProcessed(message.ref, fingerprint: message.fingerprint)
       {
+        let text = try automation.preview(ref: message.ref, maxCharacters: preview)
+        message.sanitizedText = text
+        message.hint = TriageRules.hint(sender: message.sender, subject: message.subject, text: text)
         messages.append(message)
       }
     }
