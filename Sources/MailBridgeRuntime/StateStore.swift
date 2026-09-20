@@ -33,6 +33,9 @@ package final class StateStore {
     guard sqlite3_open(path, &db) == SQLITE_OK else {
       throw MailBridgeError.storage("无法打开本地状态数据库：\(lastError)")
     }
+    // Allow short contention between bridge processes, but never wait forever
+    // or replay a state mutation after an uncertain outcome.
+    sqlite3_busy_timeout(db, 5_000)
     try execute("PRAGMA journal_mode=WAL;")
     try execute("PRAGMA foreign_keys=ON;")
     try migrate()
@@ -489,6 +492,8 @@ package final class StateStore {
   }
 
   private func setDefault(key: String, value: String) throws {
+    // Existing state readers do not need a writer lock just to keep defaults.
+    if try setting(key) != nil { return }
     try withStatement("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?);") { statement in
       bind(key, 1, statement)
       bind(value, 2, statement)

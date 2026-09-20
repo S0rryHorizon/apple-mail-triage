@@ -49,6 +49,10 @@ printf '%s' '{"action":"message.scan","limit":200,"previewCharacters":800}' | "$
 
 The first scan covers the previous 24 hours. Later scans use persisted cursors and a 15-minute overlap. A run freezes its `since`/`until` window and follows `nextOffset` until `hasMore` is false before advancing successful account cursors. See [the full interface contract](skill/email-triage/references/interface.md).
 
+Scanning fetches metadata before deduplication and reads previews only for new messages on the current page. `previewCharacters: 0` does not fetch bodies. Default windows consider only currently enabled accounts; an account without a cursor gets the initial 24-hour lookback, while orphan and disabled-account cursors remain stored without widening the window. Receive times come directly from Mail and do not drift with scan duration.
+
+Mail events have a 30-second timeout. Scans also enforce a 60-second budget between messages and preview reads (an in-flight Mail event must return or time out first). Metadata/body failures return an error rather than a successful partial page. SQLite waits up to five seconds for a transient lock; existing state reads avoid acquiring a writer lock for defaults. No scan advances state, and failed scans must never be recorded as complete.
+
 Real flagging is disabled in a fresh state database. After reviewing shadow-mode results and explicitly deciding to enable it:
 
 ```sh

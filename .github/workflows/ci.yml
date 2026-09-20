@@ -22,3 +22,5 @@ jobs:
         run: swift run MailBridgeSyntheticDemo
       - name: Dispatcher contract tests
         run: python3 -m unittest Tests/dispatcher_contract_test.py
+      - name: Scan regression and lock contention tests
+        run: python3 -m unittest Tests/scan_test.py

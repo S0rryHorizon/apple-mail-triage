@@ -43,6 +43,10 @@ Parse only after the original command reaches a terminal result. Size both the c
 
 Each message contains `ref`, `receivedAt`, `sender`, `subject`, `sanitizedText`, current `flagIndex`, a stable `fingerprint`, and a conservative `hint`. The hint is not the final classification.
 
+Scans deduplicate metadata before fetching any body. `previewCharacters: 0` fetches no body, and lookahead/processed/duplicate messages do not fetch previews. Default windows ignore orphan and disabled-account cursors without deleting them; enabled accounts without cursors retain a 24-hour initial window. Preserve the returned `since` and `until` on every subsequent page.
+
+A Mail event times out after 30 seconds. A scan checks a 60-second budget between messages and body reads; an in-flight event can take additional time to return or time out. A timeout or unreadable metadata/body fails the page, never reports it as complete, and must not advance cursors or increment the shadow-run count. Stop and report the incomplete run; a later attempt can use a smaller `limit` and the same frozen window after the original call has ended. SQLite tolerates brief lock contention for up to five seconds without replaying a state mutation.
+
 ## Attachments
 
 Use `attachment.export` with a message `ref` and `attachmentId`. The bridge rejects unsafe types, files over 10 MB, or messages whose attachments exceed 20 MB. The response contains a path and `cleanupToken`. After inspection, always call:
