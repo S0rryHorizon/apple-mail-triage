@@ -1,30 +1,46 @@
 import Foundation
 import MailBridgeCore
 
-final class MailBridgeService {
+public final class MailBridgeService {
   private let automation: MailAutomation
   private let store: StateStore
   private let accountProvider: () throws -> [MailAccount]
+  private let scanProvider: (Date, Date, Int, Int, Int) throws -> [MailMessage]
 
-  init() throws {
-    automation = MailAutomation()
+  public init() throws {
+    let mail = MailAutomation()
+    automation = mail
     store = try StateStore()
-    accountProvider = { try MailAutomation().accounts() }
+    accountProvider = { try mail.accounts() }
+    scanProvider = { since, until, offset, limit, _ in
+      try mail.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
   }
 
-  init(store: StateStore, accountProvider: @escaping () throws -> [MailAccount]) {
-    automation = MailAutomation()
+  package init(
+    store: StateStore,
+    accountProvider: @escaping () throws -> [MailAccount],
+    scanProvider: ((Date, Date, Int, Int, Int) throws -> [MailMessage])? = nil
+  ) {
+    let mail = MailAutomation()
+    automation = mail
     self.store = store
     self.accountProvider = accountProvider
+    self.scanProvider = scanProvider ?? { since, until, offset, limit, _ in
+      try mail.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
   }
 
   init(automation: MailAutomation, store: StateStore) {
     self.automation = automation
     self.store = store
     self.accountProvider = { try automation.accounts() }
+    self.scanProvider = { since, until, offset, limit, _ in
+      try automation.scanMetadata(since: since, until: until, offset: offset, limit: limit)
+    }
   }
 
-  func handle(_ request: BridgeRequest) throws -> BridgeResponse {
+  public func handle(_ request: BridgeRequest) throws -> BridgeResponse {
     switch request.action {
     case "setup": return try status(request, setup: true)
     case "status": return try status(request, setup: false)
@@ -63,7 +79,7 @@ final class MailBridgeService {
 
   private func scan(_ request: BridgeRequest) throws -> BridgeResponse {
     let state = try store.summary()
-    let enabledAccountIds = Set(try automation.accounts().filter(\.enabled).map(\.id))
+    let enabledAccountIds = Set(try accountProvider().filter(\.enabled).map(\.id))
     let since: Date
     if let value = request.since {
       guard let parsed = DateCodec.date(value) else {
@@ -91,13 +107,11 @@ final class MailBridgeService {
     }
     let offset = max(request.offset ?? 0, 0)
     let limit = min(max(request.limit ?? 200, 1), 1_000)
+    guard offset <= Int.max - limit else {
+      throw MailBridgeError.invalidRequest("offset 过大。")
+    }
     let preview = min(max(request.previewCharacters ?? 800, 0), 4_000)
-    let scanned = try automation.scanMetadata(
-      since: since,
-      until: until,
-      offset: offset,
-      limit: limit + 1
-    )
+    let scanned = try scanProvider(since, until, offset, limit + 1, 0)
     let hasMore = scanned.count > limit
     let page = Array(scanned.prefix(limit))
     var messages: [MailMessage] = []
@@ -114,7 +128,11 @@ final class MailBridgeService {
       }
     }
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
-    response.messages = messages.sorted { $0.receivedAt > $1.receivedAt }
+    response.messages = messages.sorted {
+      if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
+      if $0.ref.accountId != $1.ref.accountId { return $0.ref.accountId < $1.ref.accountId }
+      return $0.ref.libraryId < $1.ref.libraryId
+    }
     response.rules = try store.rules()
     response.state = state
     response.details = [

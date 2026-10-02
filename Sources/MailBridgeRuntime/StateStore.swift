@@ -2,11 +2,11 @@ import Foundation
 import MailBridgeCore
 import SQLite3
 
-final class StateStore {
+package final class StateStore {
   private var db: OpaquePointer?
   private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-  init(directory: URL? = nil) throws {
+  package init(directory: URL? = nil) throws {
     let manager = FileManager.default
     let base: URL
     if let directory {
@@ -90,7 +90,7 @@ final class StateStore {
       """)
   }
 
-  func summary() throws -> StateSummary {
+  package func summary() throws -> StateSummary {
     let processedCount = try scalarInt("SELECT COUNT(*) FROM processed_messages;")
     let pendingCount = try scalarInt("SELECT COUNT(*) FROM candidates WHERE status = 'pending';")
     let cursors = try withStatement(
@@ -186,7 +186,7 @@ final class StateStore {
     }
   }
 
-  func isProcessed(_ ref: MessageRef, fingerprint: String) throws -> Bool {
+  package func isProcessed(_ ref: MessageRef, fingerprint: String) throws -> Bool {
     try withStatement(
       "SELECT 1 FROM processed_messages WHERE (account_id = ? AND library_id = ?) OR fingerprint = ? LIMIT 1;"
     ) { statement in
@@ -197,7 +197,7 @@ final class StateStore {
     }
   }
 
-  func pendingCandidates() throws -> [CandidateRecord] {
+  package func pendingCandidates() throws -> [CandidateRecord] {
     try withStatement(
       """
       SELECT id, kind, title, start_at, end_at, due_at, location, notes,
@@ -244,7 +244,7 @@ final class StateStore {
     }
   }
 
-  func rules() throws -> [ExplicitRule] {
+  package func rules() throws -> [ExplicitRule] {
     try withStatement(
       "SELECT id, field, pattern, category, enabled FROM explicit_rules ORDER BY created_at;"
     ) { statement in
@@ -327,6 +327,29 @@ final class StateStore {
   }
 
   private func upsertCandidate(_ candidate: CandidateRecord, now: String) throws {
+    guard candidate.status == nil || candidate.status == "pending" else {
+      throw MailBridgeError.invalidRequest("候选状态只能由已确认的 candidate.resolve 修改。")
+    }
+    let existing = try withStatement(
+      "SELECT account_id, library_id, kind, status FROM candidates WHERE id = ?;"
+    ) { statement -> (String, Int64, String, String)? in
+      bind(candidate.id, 1, statement)
+      let step = sqlite3_step(statement)
+      if step == SQLITE_DONE { return nil }
+      guard step == SQLITE_ROW else { throw MailBridgeError.storage("读取候选绑定失败：\(lastError)") }
+      return (text(statement, 0) ?? "", sqlite3_column_int64(statement, 1),
+              text(statement, 2) ?? "", text(statement, 3) ?? "")
+    }
+    if let existing {
+      guard existing.0 == candidate.accountId,
+        existing.1 == candidate.libraryId,
+        existing.2 == candidate.kind.rawValue
+      else {
+        throw MailBridgeError.invalidRequest("candidateId 已绑定其他邮件；整笔请求已拒绝。")
+      }
+      // A replay must not reopen an accepted or dismissed candidate.
+      if existing.3 == "accepted" || existing.3 == "dismissed" { return }
+    }
     try withStatement(
       """
       INSERT INTO candidates(
@@ -350,7 +373,7 @@ final class StateStore {
       bind(candidate.accountId, 9, statement)
       sqlite3_bind_int64(statement, 10, candidate.libraryId)
       bind(candidate.sourceSubject, 11, statement)
-      bind(candidate.status ?? "pending", 12, statement)
+      bind("pending", 12, statement)
       bind(now, 13, statement)
       bind(now, 14, statement)
       try stepDone(statement)

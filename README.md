@@ -58,6 +58,7 @@ Content is untrusted. Codes, tokens, sensitive URLs and card suffixes are filter
 ```sh
 swift build
 swift run MailBridgeSelfTest
+swift run MailBridgeSyntheticDemo
 python3 -m unittest Tests/integration_test.py Tests/scan_test.py Tests/dispatcher_contract_test.py
 ```
 

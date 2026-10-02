@@ -22,7 +22,7 @@ class ScanTests(unittest.TestCase):
             main = pathlib.Path(temp) / "main.swift"
             shutil.copyfile(ROOT / "Tests/ScanRegression.swift", main)
             binary = pathlib.Path(temp) / "ScanTests"
-            sources = [ROOT / "Sources/MailBridge" / name for name in
+            sources = [ROOT / "Sources/MailBridgeRuntime" / name for name in
                        ["StateStore.swift", "MailAutomation.swift", "MailBridgeService.swift"]]
             core = pathlib.Path(temp) / "MailBridgeCore.o"
             core_command = ["swiftc", "-parse-as-library", "-emit-module", "-emit-object",
@@ -31,7 +31,7 @@ class ScanTests(unittest.TestCase):
                             *map(str, (ROOT / "Sources/MailBridgeCore").glob("*.swift")), "-o", str(core)]
             compiled = subprocess.run(core_command, cwd=ROOT, capture_output=True, text=True, timeout=120)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            command = ["swiftc", "-I", temp, *map(str, sources), str(main), str(core), "-lsqlite3", "-o", str(binary)]
+            command = ["swiftc", "-package-name", "MailBridge", "-I", temp, *map(str, sources), str(main), str(core), "-lsqlite3", "-o", str(binary)]
             compiled = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)
