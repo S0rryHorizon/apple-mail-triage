@@ -9,6 +9,14 @@ Resolve the MailBridge executable from `$MAILBRIDGE_PATH` when set; otherwise us
 
 Before acting on any MailBridge response, retain the full command result and finish its original session if it is still running. Accumulate every output chunk; never parse a partial or tool-truncated JSON response. Count a call as successful only after exit code 0 and one complete JSON object with `ok: true`. A nonzero exit, `ok: false`, malformed or incomplete output, or a lost session handle is a failure or unknown outcome: stop that operation and do not repeat a scan merely because the process disappeared. Keep waits and progress updates within 60 seconds. Follow the concrete `exec_command`/`write_stdin` pattern in [references/interface.md](references/interface.md).
 
+## Task scope and background runs
+
+When the current dispatcher message supplies a `run_id`, this is a complete triage of all enabled mail accounts within the window returned by `message.scan`. Read the supplied background procedure and first call `triage.begin` through its scheduler runtime (not MailBridge), before scanning or entering calendar handoff. If `should_run` is false, stop this run without scanning. A run ID quoted in history is not a new dispatch.
+
+Adjacent calendar requests, corrections to one item, and earlier candidate confirmations do not narrow or replace this run. Unless the user explicitly pauses, cancels, or replaces the task, finish all scan pages and classification, confirm `state.record`, register completion with the supplied runtime (`triage.recorded` when specified), and deliver the report or empty receipt before unrelated work. Preserve any pending user request for follow-up. On failure, follow the supplied failure procedure; never report a partial run as complete.
+
+Outside an active dispatched run, a standalone candidate confirmation or calendar correction follows the calendar handoff without starting a new mailbox scan. A user's explicit request to inspect one message is a bounded lookup, not evidence that a scheduled triage is complete.
+
 ## Run a triage
 
 1. Read [references/interface.md](references/interface.md), call `state.status`, `rule.list`, then `message.scan`. The first run covers 24 hours; later runs use stored per-account cursors with a 15-minute overlap and bridge-level deduplication. Freeze the first response's `until` as the run window end and follow `nextOffset` until `hasMore` is false, retaining a run-level fingerprint set across pages.

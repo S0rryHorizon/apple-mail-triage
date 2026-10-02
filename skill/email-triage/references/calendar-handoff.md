@@ -1,5 +1,7 @@
 # CalendarBridge handoff
 
+Before this handoff, apply the task-scope rules in [SKILL.md](../SKILL.md). A candidate confirmation or correction does not replace an active dispatched triage; finish its full scan, state recording, run registration and report first unless the user explicitly pauses, cancels or replaces it. Once the run is finished, handle the user's calendar request separately without restarting the scan or replaying an old confirmation.
+
 Use the installed `$apple-calendar-assistant`. Resolve its bridge from `$CALENDAR_BRIDGE_PATH` when set, otherwise use:
 
 ```text
