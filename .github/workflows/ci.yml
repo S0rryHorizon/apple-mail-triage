@@ -18,3 +18,5 @@ jobs:
         run: swift run MailBridgeSelfTest
       - name: State integration tests
         run: python3 -m unittest Tests/integration_test.py
+      - name: Scan and dispatcher regression tests
+        run: python3 -m unittest Tests/scan_test.py Tests/dispatcher_contract_test.py

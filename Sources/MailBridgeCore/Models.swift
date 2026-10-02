@@ -61,6 +61,9 @@ public struct AttachmentInfo: Codable, Equatable, Sendable {
   public var name: String
   public var mimeType: String
   public var size: Int64
+  public var effectiveMimeType: String?
+  public var mimeInferred: Bool?
+  public var rejectionReason: String?
   public var downloaded: Bool
 
   public init(id: String, name: String, mimeType: String, size: Int64, downloaded: Bool) {
@@ -69,6 +72,12 @@ public struct AttachmentInfo: Codable, Equatable, Sendable {
     self.mimeType = mimeType
     self.size = size
     self.downloaded = downloaded
+    switch TriageRules.attachmentDecision(name: name, mimeType: mimeType, size: size) {
+    case .allowed(let mime, let inferred):
+      effectiveMimeType = mime
+      mimeInferred = inferred
+    case .rejected(let reason): rejectionReason = reason.rawValue
+    }
   }
 }
 
@@ -81,7 +90,6 @@ public struct MailMessage: Codable, Equatable, Sendable {
   public var subject: String
   public var sanitizedText: String?
   public var isRead: Bool
-  public var flagIndex: Int
   public var attachmentCount: Int
   public var attachments: [AttachmentInfo]?
   public var fingerprint: String
@@ -96,7 +104,6 @@ public struct MailMessage: Codable, Equatable, Sendable {
     subject: String,
     sanitizedText: String?,
     isRead: Bool,
-    flagIndex: Int,
     attachmentCount: Int,
     attachments: [AttachmentInfo]?,
     fingerprint: String,
@@ -110,41 +117,10 @@ public struct MailMessage: Codable, Equatable, Sendable {
     self.subject = subject
     self.sanitizedText = sanitizedText
     self.isRead = isRead
-    self.flagIndex = flagIndex
     self.attachmentCount = attachmentCount
     self.attachments = attachments
     self.fingerprint = fingerprint
     self.hint = hint
-  }
-}
-
-public struct FlagInstruction: Codable, Sendable {
-  public var ref: MessageRef
-  public var color: String
-}
-
-public struct FlagResult: Codable, Equatable, Sendable {
-  public var ref: MessageRef
-  public var requestedColor: String
-  public var previousFlagIndex: Int
-  public var resultingFlagIndex: Int
-  public var status: String
-  public var message: String?
-
-  public init(
-    ref: MessageRef,
-    requestedColor: String,
-    previousFlagIndex: Int,
-    resultingFlagIndex: Int,
-    status: String,
-    message: String?
-  ) {
-    self.ref = ref
-    self.requestedColor = requestedColor
-    self.previousFlagIndex = previousFlagIndex
-    self.resultingFlagIndex = resultingFlagIndex
-    self.status = status
-    self.message = message
   }
 }
 
@@ -235,8 +211,6 @@ public struct StateUpdate: Codable, Sendable {
   public var processed: [ProcessedRecord]?
   public var candidates: [CandidateRecord]?
   public var cursors: [CursorRecord]?
-  public var shadowRunsCompleted: Int?
-  public var flaggingEnabled: Bool?
 }
 
 public struct BridgeRequest: Codable, Sendable {
@@ -252,9 +226,8 @@ public struct BridgeRequest: Codable, Sendable {
   public var attachmentId: String?
   public var cleanupToken: String?
   public var confirmed: Bool?
-  public var batchId: String?
-  public var flags: [FlagInstruction]?
   public var state: StateUpdate?
+  public var accountIds: [String]?
   public var candidateIds: [String]?
   public var candidateStatus: String?
   public var rule: ExplicitRule?
@@ -266,21 +239,15 @@ public struct StateSummary: Codable, Equatable, Sendable {
   public var processedCount: Int
   public var pendingCandidateCount: Int
   public var cursors: [CursorRecord]
-  public var shadowRunsCompleted: Int
-  public var flaggingEnabled: Bool
 
   public init(
     processedCount: Int,
     pendingCandidateCount: Int,
-    cursors: [CursorRecord],
-    shadowRunsCompleted: Int,
-    flaggingEnabled: Bool
+    cursors: [CursorRecord]
   ) {
     self.processedCount = processedCount
     self.pendingCandidateCount = pendingCandidateCount
     self.cursors = cursors
-    self.shadowRunsCompleted = shadowRunsCompleted
-    self.flaggingEnabled = flaggingEnabled
   }
 }
 
@@ -305,11 +272,9 @@ public struct BridgeResponse: Codable, Sendable {
   public var status: String
   public var requestId: String?
   public var message: String?
-  public var batchId: String?
   public var details: [String: String]?
   public var accounts: [MailAccount]?
   public var messages: [MailMessage]?
-  public var flags: [FlagResult]?
   public var candidates: [CandidateRecord]?
   public var rules: [ExplicitRule]?
   public var state: StateSummary?

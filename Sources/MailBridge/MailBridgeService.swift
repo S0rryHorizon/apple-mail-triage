@@ -4,25 +4,37 @@ import MailBridgeCore
 final class MailBridgeService {
   private let automation: MailAutomation
   private let store: StateStore
+  private let accountProvider: () throws -> [MailAccount]
 
   init() throws {
     automation = MailAutomation()
     store = try StateStore()
+    accountProvider = { try MailAutomation().accounts() }
+  }
+
+  init(store: StateStore, accountProvider: @escaping () throws -> [MailAccount]) {
+    automation = MailAutomation()
+    self.store = store
+    self.accountProvider = accountProvider
+  }
+
+  init(automation: MailAutomation, store: StateStore) {
+    self.automation = automation
+    self.store = store
+    self.accountProvider = { try automation.accounts() }
   }
 
   func handle(_ request: BridgeRequest) throws -> BridgeResponse {
     switch request.action {
     case "setup": return try status(request, setup: true)
     case "status": return try status(request, setup: false)
-    case "message.scan": return try scan(request)
+    case "message.scan": return try automation.withReadDeadline { try scan(request) }
     case "message.read": return try read(request)
     case "attachment.export": return try exportAttachment(request)
     case "attachment.cleanup": return try cleanupAttachment(request)
-    case "flag.preview": return try previewFlags(request)
-    case "flag.commit": return try commitFlags(request)
-    case "flag.rollback": return try rollbackFlags(request)
     case "state.status": return try stateStatus(request)
     case "state.record": return try recordState(request)
+    case "state.repair": return try repairState(request)
     case "state.pending": return try pendingCandidates(request)
     case "candidate.resolve": return try resolveCandidates(request)
     case "rule.list": return try listRules(request)
@@ -51,16 +63,19 @@ final class MailBridgeService {
 
   private func scan(_ request: BridgeRequest) throws -> BridgeResponse {
     let state = try store.summary()
+    let enabledAccountIds = Set(try automation.accounts().filter(\.enabled).map(\.id))
     let since: Date
     if let value = request.since {
       guard let parsed = DateCodec.date(value) else {
         throw MailBridgeError.invalidRequest("since 必须是 ISO 8601 时间。")
       }
       since = parsed
-    } else if let earliest = state.cursors.compactMap({ DateCodec.date($0.receivedAt) }).min() {
-      since = earliest.addingTimeInterval(-15 * 60)
     } else {
-      since = Date().addingTimeInterval(-24 * 60 * 60)
+      let firstRunSince = Date().addingTimeInterval(-24 * 60 * 60)
+      let cursors = Dictionary(uniqueKeysWithValues: state.cursors.map { ($0.accountId, $0.receivedAt) })
+      since = enabledAccountIds.map { accountId in
+        cursors[accountId].flatMap(DateCodec.date)?.addingTimeInterval(-15 * 60) ?? firstRunSince
+      }.min() ?? firstRunSince
     }
     let until: Date
     if let value = request.until {
@@ -77,26 +92,30 @@ final class MailBridgeService {
     let offset = max(request.offset ?? 0, 0)
     let limit = min(max(request.limit ?? 200, 1), 1_000)
     let preview = min(max(request.previewCharacters ?? 800, 0), 4_000)
-    let scanned = try automation.scan(
+    let scanned = try automation.scanMetadata(
       since: since,
       until: until,
       offset: offset,
-      limit: limit + 1,
-      previewCharacters: preview
+      limit: limit + 1
     )
     let hasMore = scanned.count > limit
     let page = Array(scanned.prefix(limit))
     var messages: [MailMessage] = []
     var seenFingerprints = Set<String>()
-    for message in page {
-      if seenFingerprints.insert(message.fingerprint).inserted,
+    for var message in page {
+      if enabledAccountIds.contains(message.ref.accountId),
+        seenFingerprints.insert(message.fingerprint).inserted,
         try !store.isProcessed(message.ref, fingerprint: message.fingerprint)
       {
+        let text = try automation.preview(ref: message.ref, maxCharacters: preview)
+        message.sanitizedText = text
+        message.hint = TriageRules.hint(sender: message.sender, subject: message.subject, text: text)
         messages.append(message)
       }
     }
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
-    response.messages = messages
+    response.messages = messages.sorted { $0.receivedAt > $1.receivedAt }
+    response.rules = try store.rules()
     response.state = state
     response.details = [
       "since": DateCodec.string(since),
@@ -126,16 +145,18 @@ final class MailBridgeService {
     }
     let message = try automation.read(ref: ref, maxCharacters: 0)
     let attachments = message.attachments ?? []
-    guard attachments.reduce(Int64(0), { $0 + max($1.size, 0) }) <= 20 * 1024 * 1024 else {
-      throw MailBridgeError.attachmentRejected("该邮件附件合计超过 20 MB。")
+    if let reason = TriageRules.attachmentTotalRejection(sizes: attachments.map(\.size)) {
+      throw MailBridgeError.attachmentRejected("\(reason.rawValue): \(reason.message)")
     }
     guard let attachment = attachments.first(where: { $0.id == attachmentId }) else {
       throw MailBridgeError.notFound("找不到指定附件。")
     }
-    guard TriageRules.attachmentAllowed(
-      name: attachment.name, mimeType: attachment.mimeType, size: attachment.size
-    ) else {
-      throw MailBridgeError.attachmentRejected("附件类型或大小不在安全白名单内：\(attachment.name)")
+    let mime: String
+    let inferred: Bool
+    switch TriageRules.attachmentDecision(name: attachment.name, mimeType: attachment.mimeType, size: attachment.size) {
+    case .allowed(let effective, let fallback): mime = effective; inferred = fallback
+    case .rejected(let reason):
+      throw MailBridgeError.attachmentRejected("\(reason.rawValue): \(reason.message)")
     }
     let base = FileManager.default.temporaryDirectory
       .appendingPathComponent("MailTriage", isDirectory: true)
@@ -143,14 +164,21 @@ final class MailBridgeService {
     try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     let fileName = sanitizedFileName(attachment.name)
     let output = base.appendingPathComponent(fileName)
-    try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
-    let token = try store.registerExport(path: base.path)
+    let token: String
+    do {
+      try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
+      token = try store.registerExport(path: base.path)
+    } catch {
+      try? FileManager.default.removeItem(at: base)
+      throw error
+    }
     var response = BridgeResponse(ok: true, status: "exported", requestId: request.requestId)
+    response.details = ["mimeInferred": String(inferred), "mimeDiagnostic": inferred ? "MIME 为空，已根据安全扩展名推断。" : "MIME 与扩展名匹配。"]
     response.attachment = ExportedAttachment(
       path: output.path,
       cleanupToken: token,
       name: attachment.name,
-      mimeType: attachment.mimeType,
+      mimeType: mime,
       size: attachment.size
     )
     return response
@@ -173,164 +201,6 @@ final class MailBridgeService {
     return BridgeResponse(ok: true, status: "cleaned", requestId: request.requestId)
   }
 
-  private func previewFlags(_ request: BridgeRequest) throws -> BridgeResponse {
-    guard let instructions = request.flags, !instructions.isEmpty else {
-      throw MailBridgeError.invalidRequest("flag.preview 需要非空 flags。")
-    }
-    var results: [FlagResult] = []
-    for instruction in instructions {
-      do {
-        let desired = try TriageRules.flagIndex(for: instruction.color)
-        let previous = try automation.flagIndex(ref: instruction.ref)
-        results.append(
-          FlagResult(
-            ref: instruction.ref,
-            requestedColor: instruction.color,
-            previousFlagIndex: previous,
-            resultingFlagIndex: previous == -1 ? desired : previous,
-            status: previous == -1 ? "would_flag" : "preserved_existing",
-            message: previous == -1 ? nil : "邮件已有旗标，不会覆盖。"
-          ))
-      } catch {
-        results.append(
-          FlagResult(
-            ref: instruction.ref,
-            requestedColor: instruction.color,
-            previousFlagIndex: -1,
-            resultingFlagIndex: -1,
-            status: "error",
-            message: String(describing: error)
-          ))
-      }
-    }
-    var response = BridgeResponse(ok: true, status: "preview", requestId: request.requestId)
-    response.flags = results
-    response.state = try store.summary()
-    return response
-  }
-
-  private func commitFlags(_ request: BridgeRequest) throws -> BridgeResponse {
-    guard request.confirmed == true else {
-      throw MailBridgeError.confirmationRequired("flag.commit 需要 confirmed: true。")
-    }
-    let state = try store.summary()
-    guard state.flaggingEnabled else {
-      throw MailBridgeError.confirmationRequired("真实旗标尚未启用；请继续使用 flag.preview 完成影子运行。")
-    }
-    guard let instructions = request.flags, !instructions.isEmpty else {
-      throw MailBridgeError.invalidRequest("flag.commit 需要非空 flags。")
-    }
-    let batchId = request.batchId ?? UUID().uuidString.lowercased()
-    try store.beginFlagBatch(batchId)
-    var results: [FlagResult] = []
-    for instruction in instructions {
-      do {
-        let desired = try TriageRules.flagIndex(for: instruction.color)
-        let previous = try automation.flagIndex(ref: instruction.ref)
-        if previous != -1 {
-          results.append(
-            FlagResult(
-              ref: instruction.ref,
-              requestedColor: instruction.color,
-              previousFlagIndex: previous,
-              resultingFlagIndex: previous,
-              status: "preserved_existing",
-              message: "邮件已有旗标，不会覆盖。"
-            ))
-          continue
-        }
-        let resulting = try automation.setFlagIndex(ref: instruction.ref, value: desired)
-        let operation = FlagAuditOperation(
-          ref: instruction.ref,
-          previousFlagIndex: previous,
-          resultingFlagIndex: resulting,
-          requestedColor: instruction.color
-        )
-        try store.recordFlag(batchId: batchId, operation: operation)
-        results.append(
-          FlagResult(
-            ref: instruction.ref,
-            requestedColor: instruction.color,
-            previousFlagIndex: previous,
-            resultingFlagIndex: resulting,
-            status: "flagged",
-            message: nil
-          ))
-      } catch {
-        results.append(
-          FlagResult(
-            ref: instruction.ref,
-            requestedColor: instruction.color,
-            previousFlagIndex: -1,
-            resultingFlagIndex: -1,
-            status: "error",
-            message: String(describing: error)
-          ))
-      }
-    }
-    var response = BridgeResponse(ok: true, status: "committed", requestId: request.requestId)
-    response.batchId = batchId
-    response.flags = results
-    return response
-  }
-
-  private func rollbackFlags(_ request: BridgeRequest) throws -> BridgeResponse {
-    guard request.confirmed == true, let batchId = request.batchId else {
-      throw MailBridgeError.confirmationRequired("flag.rollback 需要 batchId 和 confirmed: true。")
-    }
-    let operations = try store.flagOperations(batchId: batchId)
-    guard !operations.isEmpty else { throw MailBridgeError.notFound("该批次没有可回滚的旗标。") }
-    var results: [FlagResult] = []
-    var failed = false
-    for operation in operations {
-      do {
-        let current = try automation.flagIndex(ref: operation.ref)
-        if current != operation.resultingFlagIndex {
-          results.append(
-            FlagResult(
-              ref: operation.ref,
-              requestedColor: operation.requestedColor,
-              previousFlagIndex: current,
-              resultingFlagIndex: current,
-              status: "preserved_user_change",
-              message: "当前旗标已变化，不覆盖用户后续修改。"
-            ))
-          continue
-        }
-        let resulting = try automation.setFlagIndex(ref: operation.ref, value: operation.previousFlagIndex)
-        results.append(
-          FlagResult(
-            ref: operation.ref,
-            requestedColor: operation.requestedColor,
-            previousFlagIndex: current,
-            resultingFlagIndex: resulting,
-            status: "rolled_back",
-            message: nil
-          ))
-      } catch {
-        failed = true
-        results.append(
-          FlagResult(
-            ref: operation.ref,
-            requestedColor: operation.requestedColor,
-            previousFlagIndex: -1,
-            resultingFlagIndex: -1,
-            status: "error",
-            message: String(describing: error)
-          ))
-      }
-    }
-    if !failed { try store.markFlagBatchRolledBack(batchId) }
-    var response = BridgeResponse(
-      ok: !failed,
-      status: failed ? "partial_error" : "rolled_back",
-      requestId: request.requestId
-    )
-    response.batchId = batchId
-    response.flags = results
-    return response
-  }
-
   private func stateStatus(_ request: BridgeRequest) throws -> BridgeResponse {
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
     response.state = try store.summary()
@@ -341,11 +211,22 @@ final class MailBridgeService {
     guard let update = request.state else {
       throw MailBridgeError.invalidRequest("state.record 缺少 state。")
     }
-    if update.flaggingEnabled == true && request.confirmed != true {
-      throw MailBridgeError.confirmationRequired("启用真实旗标需要 confirmed: true。")
-    }
-    try store.record(update)
+    try store.record(update, enabledAccountIds: Set(try accountProvider().filter(\.enabled).map(\.id)))
     var response = BridgeResponse(ok: true, status: "recorded", requestId: request.requestId)
+    response.state = try store.summary()
+    return response
+  }
+
+  private func repairState(_ request: BridgeRequest) throws -> BridgeResponse {
+    guard request.confirmed == true else {
+      throw MailBridgeError.confirmationRequired("state.repair 需要 confirmed: true。")
+    }
+    guard let ids = request.accountIds, !ids.isEmpty else {
+      throw MailBridgeError.invalidRequest("state.repair 需要非空 accountIds。")
+    }
+    // Disabled accounts still exist and their cursors must be preserved.
+    try store.removeOrphanCursors(ids: ids, knownAccountIds: Set(try accountProvider().map(\.id)))
+    var response = BridgeResponse(ok: true, status: "repaired", requestId: request.requestId)
     response.state = try store.summary()
     return response
   }

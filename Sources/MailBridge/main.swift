@@ -15,8 +15,7 @@ private func inputData() throws -> Data {
         MailBridge --request request.json
 
       Read: setup, status, message.scan, message.read, attachment.export/cleanup
-      Flags: flag.preview, flag.commit, flag.rollback
-      State: state.status, state.record, state.pending, candidate.resolve, rule.list/upsert
+      State: state.status, state.record, state.repair, state.pending, candidate.resolve, rule.list/upsert
       """
     FileHandle.standardOutput.write(Data(help.utf8))
     exit(0)

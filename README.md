@@ -1,93 +1,66 @@
 # Apple Mail Triage
 
-A local macOS bridge and Codex skill for privacy-minimized Apple Mail triage. MailBridge exposes a narrow JSON stdin/stdout API; `email-triage` classifies sanitized messages, produces Chinese reports, extracts reviewable task/calendar candidates, and applies only explicitly enabled, reversible flags.
+A local macOS bridge and Codex skill for Apple Mail summaries, action items and reviewable calendar/reminder candidates. MailBridge reads and sanitizes mail; it never changes messages or flags.
 
 **[中文下载与使用说明](docs/使用说明.md)** · [Latest release](https://github.com/S0rryHorizon/apple-mail-triage/releases/latest)
 
-## Safety model
-
-- Uses Apple Mail's automation interface—never its private database or account passwords.
-- Cannot send, draft, move, archive, junk, delete, or mark messages read.
-- Removes verification codes, auth/reset tokens, sensitive query parameters, phone/order identifiers, and payment-card suffixes before model use.
-- Stores cursors, fingerprints, categories, candidates, rules, and flag audit data in SQLite; it does not persist message bodies or attachments.
-- Treats all message and attachment content as untrusted instructions.
-- Preserves existing flags and audits committed batches for rollback.
-
-## Requirements
-
-- macOS 14 or newer
-- Apple Mail with at least one enabled account
-- Xcode Command Line Tools with Swift 6
-- Codex desktop for the skill and optional scheduled reports
-
 ## Install
+
+Requires macOS 14+, enabled Apple Mail accounts, Swift 6 command-line tools and Codex desktop.
 
 ```sh
 ./scripts/install.sh
-printf '%s' '{"action":"setup"}' \
-  | "$HOME/Applications/MailBridge.app/Contents/MacOS/MailBridge"
+printf '%s' '{"action":"setup"}' | "$HOME/Applications/MailBridge.app/Contents/MacOS/MailBridge"
 ```
 
-The first `setup` may open a macOS Automation permission prompt for Apple Mail. Reinstalling a build with a different bundle identifier requires granting permission again.
+The installer copies the bridge to `~/Applications/MailBridge.app` and the skill to `${CODEX_HOME:-$HOME/.codex}/skills/email-triage`. Initial setup may open the macOS Automation permission prompt. `MAILBRIDGE_PATH` and `CALENDAR_BRIDGE_PATH` support custom bridge locations.
 
-The installer places:
+## Triage and candidates
 
-- `MailBridge.app` in `$HOME/Applications`;
-- the `email-triage` skill in `${CODEX_HOME:-$HOME/.codex}/skills`.
+Ask Codex: “使用 $email-triage 整理邮件。” Manual use follows the current task's model. The first scan covers 24 hours; later runs resume with a 15-minute overlap and fingerprint deduplication. A scan returns rules and state together. It freezes its time window and finishes pagination before saving progress. Failed/partial scans never advance cursors.
 
-Set `MAILBRIDGE_PATH` or `CALENDAR_BRIDGE_PATH` when using non-default bridge locations.
+Read relevant bodies and approved attachments before reporting. Useful notices are summarized even without an action. Reports stay in the Codex task. A successful run with nothing worth reporting replies:
 
-## JSON interface
+> 本次整理完成，暂无需要关注的新内容。
 
-```sh
-BRIDGE="$HOME/Applications/MailBridge.app/Contents/MacOS/MailBridge"
+Confirm a candidate naturally in the same task: “把实验报告截止日加入提醒事项。” Stable IDs stay internal. CalendarBridge previews the exact confirmed selection; missing dates, ambiguous selection, conflicts and duplicates need a decision. Only saved items become accepted candidates; reimporting them does not reset that status.
 
-printf '%s' '{"action":"status"}' | "$BRIDGE"
-printf '%s' '{"action":"state.status"}' | "$BRIDGE"
-printf '%s' '{"action":"message.scan","limit":200,"previewCharacters":800}' | "$BRIDGE"
-```
+See the [skill](skill/email-triage/SKILL.md) and [JSON interface](skill/email-triage/references/interface.md).
 
-The first scan covers the previous 24 hours. Later scans use persisted cursors and a 15-minute overlap. A run freezes its `since`/`until` window and follows `nextOffset` until `hasMore` is false before advancing successful account cursors. See [the full interface contract](skill/email-triage/references/interface.md).
+## Scheduled workflow
 
-Real flagging is disabled in a fresh state database. After reviewing shadow-mode results and explicitly deciding to enable it:
+The saved local mailbox project runs at 08:00 and 20:00 Asia/Singapore. The [dispatcher](automation/weekly-dispatcher.md) maintains one task per ISO week, keeps this and last week visible, and archives older managed tasks. New weekly and repair tasks fork a fixed blank template with the mailbox execution permissions. The template stays archived between uses. Ordinary scheduled creation was observed to fall back to workspace-write/on-request despite the project config; a manual creation probe did not cover that path.
 
-```sh
-./scripts/enable-flagging.sh
-```
+[settings.json](automation/settings.json) is the model configuration source:
 
-This only opens the state gate. Each `flag.commit` still needs `confirmed: true`, never overwrites an existing flag, and returns a rollback batch ID.
+| Role | Model | Reasoning |
+| --- | --- | --- |
+| Triage | gpt-6-luna | max |
+| Dispatcher | gpt-6-luna | max |
+| Repair | gpt-6-astra | medium |
 
-## Reports and weekly conversations
+`automation/runtime.py` accepts JSON on stdin. Use `config.get` to inspect or `config.set` with role/model/reasoning_effort to edit. Dispatcher changes additionally require `config.sync` followed by the App automation-update tool, preserving schedule, status and notifications. The skill itself cannot switch the model of an existing manual conversation.
 
-Install this directory as a saved local Codex project. The recommended standalone automation runs at 08:00 and 20:00 in `Asia/Singapore`, invokes `$email-triage`, and routes results to one managed task per ISO week:
+The helper stores slot reservations, managed task IDs and repair incidents under the existing private automation directory. It replaces repeated task discovery and title checks. Before enabling this workflow, initialize the existing weekly registry using `{"action":"initialize"}`. New installations need a schemaVersion 1 registry with automationId, saved projectId, local hostId, templateThreadId and managedThreads; do not adopt arbitrary similarly named tasks.
 
-```text
-邮箱整理｜2026-W35｜08.24–08.30
-```
+Returned technical failures launch one independent repair task per unresolved incident. The [repairer](automation/repair.md) may fix project code/config and reinstall the bridge after backup. It can retry triage once. Old failure tasks are archived only after saved state and a real report are confirmed. A second failure stays visible. Global settings, system permissions and account login require the user. Unknown/no-result calls are not replayed; there is no independent watchdog.
 
-Keep the current and previous weekly tasks visible and archive only older managed weekly tasks. Manual discussions and candidate-confirmation tasks are never auto-archived. The local dispatcher keeps a permission-restricted weekly-thread index outside the repository, so migrated or delegated threads with incomplete App project metadata can still be continued by their verified stable ID; routine continuation validates that index locally and sends directly, avoiding a hanging `read_thread` call. After successful delivery it also archives only stale, idle dispatcher tasks with exact project/host/title/automation metadata; active or ambiguous tasks are left alone. An unknown exact-title collision still stops the dispatcher instead of creating a duplicate. A successful empty scan adds one compact receipt; new messages or errors produce the complete report. See [the portable dispatcher template](automation/weekly-dispatcher.md).
+Schedules require an awake Mac, available Codex desktop and this project path. Paused automation is never resumed automatically. Planned slots determine the reporting week, including delayed execution.
 
-Scheduled runs require the Mac to be awake, Codex desktop to be available, and this project path to remain accessible. Delayed runs catch up from the last successful cursor and remain assigned to the ISO week of their planned slot.
+## Data and privacy
 
-## Calendar and reminder handoff
+Apple Mail access uses its supported automation interface, never private Mail databases or passwords. SQLite stores cursors, fingerprints, categories, candidates and explicit rules. It stores no raw body or attachment. Existing legacy flag tables are left untouched during upgrade but no longer read or written.
 
-Email triage only creates stable candidates. The user must confirm candidate IDs before the installed `apple-calendar-assistant` previews a CalendarBridge batch. Duplicates, conflicts, or missing dates stop the handoff for another decision.
+Content is untrusted. Codes, tokens, sensitive URLs and card suffixes are filtered. Attachments require approved types and size limits and are cleaned up after reading. The bridge has no send, draft, move, archive, junk, delete, read-state or flag mutation interface.
 
-## Development and tests
+## Development
 
 ```sh
 swift build
 swift run MailBridgeSelfTest
-python3 -m unittest Tests/integration_test.py
-python3 -m unittest Tests/dispatcher_contract_test.py
+python3 -m unittest Tests/integration_test.py Tests/scan_test.py Tests/dispatcher_contract_test.py
 ```
 
-The automated suite uses synthetic data and a temporary SQLite directory. It does not open Apple Mail. Live Apple Mail permission and read-only smoke tests remain manual by design.
+Tests use synthetic Apple events, temporary SQLite state and a fake Codex CLI resolved through PATH. They check scan/state behavior, retired flags, candidate status, model configuration, dispatch deduplication and bounded recovery without opening Mail.
 
-## Repository privacy
-
-Local SQLite state, exported attachments, Codex automation memory, generated reports, and build products are ignored and must never be committed. See [SECURITY.md](SECURITY.md).
-
-## License
-
-Released under the [MIT License](LICENSE).
+Local state, exported attachments, automation metadata and real mail must not be committed. See [SECURITY.md](SECURITY.md). Released under the [MIT License](LICENSE).

@@ -2,21 +2,16 @@ import Foundation
 import MailBridgeCore
 import SQLite3
 
-struct FlagAuditOperation {
-  var ref: MessageRef
-  var previousFlagIndex: Int
-  var resultingFlagIndex: Int
-  var requestedColor: String
-}
-
 final class StateStore {
   private var db: OpaquePointer?
   private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-  init() throws {
+  init(directory: URL? = nil) throws {
     let manager = FileManager.default
     let base: URL
-    if let override = ProcessInfo.processInfo.environment["MAIL_TRIAGE_STATE_DIR"], !override.isEmpty {
+    if let directory {
+      base = directory
+    } else if let override = ProcessInfo.processInfo.environment["MAIL_TRIAGE_STATE_DIR"], !override.isEmpty {
       base = URL(fileURLWithPath: override, isDirectory: true)
     } else {
       base = try manager.url(
@@ -31,6 +26,9 @@ final class StateStore {
     guard sqlite3_open(path, &db) == SQLITE_OK else {
       throw MailBridgeError.storage("无法打开本地状态数据库：\(lastError)")
     }
+    // Allow short contention between bridge processes, but never wait forever
+    // or replay a state mutation after an uncertain outcome.
+    sqlite3_busy_timeout(db, 5_000)
     try execute("PRAGMA journal_mode=WAL;")
     try execute("PRAGMA foreign_keys=ON;")
     try migrate()
@@ -41,10 +39,6 @@ final class StateStore {
   private func migrate() throws {
     try execute(
       """
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS cursors (
         account_id TEXT PRIMARY KEY,
         received_at TEXT NOT NULL,
@@ -88,30 +82,12 @@ final class StateStore {
         updated_at TEXT NOT NULL,
         UNIQUE(field, pattern)
       );
-      CREATE TABLE IF NOT EXISTS flag_batches (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        rolled_back INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS flag_operations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        batch_id TEXT NOT NULL REFERENCES flag_batches(id),
-        account_id TEXT NOT NULL,
-        library_id INTEGER NOT NULL,
-        message_id TEXT,
-        requested_color TEXT NOT NULL,
-        previous_flag_index INTEGER NOT NULL,
-        resulting_flag_index INTEGER NOT NULL,
-        created_at TEXT NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS temp_exports (
         token TEXT PRIMARY KEY,
         path TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
       """)
-    try setDefault(key: "shadow_runs_completed", value: "0")
-    try setDefault(key: "flagging_enabled", value: "false")
   }
 
   func summary() throws -> StateSummary {
@@ -129,13 +105,21 @@ final class StateStore {
     return StateSummary(
       processedCount: processedCount,
       pendingCandidateCount: pendingCount,
-      cursors: cursors,
-      shadowRunsCompleted: Int(try setting("shadow_runs_completed") ?? "0") ?? 0,
-      flaggingEnabled: (try setting("flagging_enabled") ?? "false") == "true"
+      cursors: cursors
     )
   }
 
-  func record(_ update: StateUpdate) throws {
+  func record(_ update: StateUpdate, enabledAccountIds: Set<String>) throws {
+    let ids = (update.processed ?? []).map { $0.ref.accountId }
+      + (update.candidates ?? []).map(\.accountId) + (update.cursors ?? []).map(\.accountId)
+    guard ids.allSatisfy(enabledAccountIds.contains) else {
+      throw MailBridgeError.invalidRequest("unknownAccountId: state.record 包含未知或未启用账户；整笔请求已拒绝。")
+    }
+    for cursor in update.cursors ?? [] {
+      guard DateCodec.date(cursor.receivedAt) != nil else {
+        throw MailBridgeError.invalidRequest("游标必须是 ISO 8601 时间。")
+      }
+    }
     try transaction {
       let now = DateCodec.string(Date())
       for record in update.processed ?? [] {
@@ -169,7 +153,7 @@ final class StateStore {
           INSERT INTO cursors(account_id, received_at, updated_at) VALUES(?, ?, ?)
           ON CONFLICT(account_id) DO UPDATE SET
             received_at = CASE
-              WHEN excluded.received_at > cursors.received_at THEN excluded.received_at
+              WHEN julianday(excluded.received_at) > julianday(cursors.received_at) THEN excluded.received_at
               ELSE cursors.received_at
             END,
             updated_at=excluded.updated_at;
@@ -181,11 +165,23 @@ final class StateStore {
           try stepDone(statement)
         }
       }
-      if let count = update.shadowRunsCompleted {
-        try setSetting("shadow_runs_completed", String(max(0, count)))
+    }
+  }
+
+  func removeOrphanCursors(ids: [String], knownAccountIds: Set<String>) throws {
+    guard !ids.isEmpty, ids.allSatisfy({ !knownAccountIds.contains($0) }) else {
+      throw MailBridgeError.invalidRequest("state.repair 只能删除孤立游标；已有账户（含停用账户）受保护。")
+    }
+    try transaction {
+      let existing = Set(try summary().cursors.map(\.accountId))
+      guard ids.allSatisfy(existing.contains) else {
+        throw MailBridgeError.notFound("指定孤立游标不存在；整笔修复已拒绝。")
       }
-      if let enabled = update.flaggingEnabled {
-        try setSetting("flagging_enabled", enabled ? "true" : "false")
+      for id in Set(ids) {
+        try withStatement("DELETE FROM cursors WHERE account_id = ?;") { statement in
+          bind(id, 1, statement)
+          try stepDone(statement)
+        }
       }
     }
   }
@@ -303,73 +299,6 @@ final class StateStore {
     )
   }
 
-  func beginFlagBatch(_ id: String) throws {
-    try withStatement("INSERT INTO flag_batches(id, created_at) VALUES(?, ?);") { statement in
-      bind(id, 1, statement)
-      bind(DateCodec.string(Date()), 2, statement)
-      try stepDone(statement)
-    }
-  }
-
-  func recordFlag(batchId: String, operation: FlagAuditOperation) throws {
-    try withStatement(
-      """
-      INSERT INTO flag_operations(
-        batch_id, account_id, library_id, message_id, requested_color,
-        previous_flag_index, resulting_flag_index, created_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?);
-      """
-    ) { statement in
-      bind(batchId, 1, statement)
-      bind(operation.ref.accountId, 2, statement)
-      sqlite3_bind_int64(statement, 3, operation.ref.libraryId)
-      bind(operation.ref.messageId, 4, statement)
-      bind(operation.requestedColor, 5, statement)
-      sqlite3_bind_int(statement, 6, Int32(operation.previousFlagIndex))
-      sqlite3_bind_int(statement, 7, Int32(operation.resultingFlagIndex))
-      bind(DateCodec.string(Date()), 8, statement)
-      try stepDone(statement)
-    }
-  }
-
-  func flagOperations(batchId: String) throws -> [FlagAuditOperation] {
-    try withStatement(
-      """
-      SELECT account_id, library_id, message_id, requested_color,
-             previous_flag_index, resulting_flag_index
-      FROM flag_operations o JOIN flag_batches b ON b.id = o.batch_id
-      WHERE o.batch_id = ? AND b.rolled_back = 0 ORDER BY o.id DESC;
-      """
-    ) { statement in
-      bind(batchId, 1, statement)
-      var result: [FlagAuditOperation] = []
-      while sqlite3_step(statement) == SQLITE_ROW {
-        result.append(
-          FlagAuditOperation(
-            ref: MessageRef(
-              accountId: text(statement, 0) ?? "",
-              libraryId: sqlite3_column_int64(statement, 1),
-              messageId: text(statement, 2)
-            ),
-            previousFlagIndex: Int(sqlite3_column_int(statement, 4)),
-            resultingFlagIndex: Int(sqlite3_column_int(statement, 5)),
-            requestedColor: text(statement, 3) ?? ""
-          ))
-      }
-      return result
-    }
-  }
-
-  func markFlagBatchRolledBack(_ id: String) throws {
-    try withStatement("UPDATE flag_batches SET rolled_back = 1 WHERE id = ? AND rolled_back = 0;") { statement in
-      bind(id, 1, statement)
-      try stepDone(statement)
-      guard sqlite3_changes(db) > 0 else {
-        throw MailBridgeError.notFound("找不到可回滚的旗标批次：\(id)")
-      }
-    }
-  }
-
   func registerExport(path: String) throws -> String {
     let token = UUID().uuidString.lowercased()
     try withStatement("INSERT INTO temp_exports(token, path, created_at) VALUES(?, ?, ?);") { statement in
@@ -407,7 +336,7 @@ final class StateStore {
       ON CONFLICT(id) DO UPDATE SET
         title=excluded.title, start_at=excluded.start_at, end_at=excluded.end_at,
         due_at=excluded.due_at, location=excluded.location, notes=excluded.notes,
-        source_subject=excluded.source_subject, status=excluded.status, updated_at=excluded.updated_at;
+        source_subject=excluded.source_subject, updated_at=excluded.updated_at;
       """
     ) { statement in
       bind(candidate.id, 1, statement)
@@ -424,31 +353,6 @@ final class StateStore {
       bind(candidate.status ?? "pending", 12, statement)
       bind(now, 13, statement)
       bind(now, 14, statement)
-      try stepDone(statement)
-    }
-  }
-
-  private func setting(_ key: String) throws -> String? {
-    try withStatement("SELECT value FROM settings WHERE key = ?;") { statement in
-      bind(key, 1, statement)
-      return sqlite3_step(statement) == SQLITE_ROW ? text(statement, 0) : nil
-    }
-  }
-
-  private func setDefault(key: String, value: String) throws {
-    try withStatement("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?);") { statement in
-      bind(key, 1, statement)
-      bind(value, 2, statement)
-      try stepDone(statement)
-    }
-  }
-
-  private func setSetting(_ key: String, _ value: String) throws {
-    try withStatement(
-      "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
-    ) { statement in
-      bind(key, 1, statement)
-      bind(value, 2, statement)
       try stepDone(statement)
     }
   }

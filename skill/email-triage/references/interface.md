@@ -1,54 +1,48 @@
 # MailBridge interface
 
-The bridge reads one JSON object from stdin and emits one JSON response. Resolve the executable from `$MAILBRIDGE_PATH` when set, otherwise use:
+The bridge accepts one JSON object on stdin and returns one JSON object. Use `$MAILBRIDGE_PATH` or `$HOME/Applications/MailBridge.app/Contents/MacOS/MailBridge`.
 
-```text
-$HOME/Applications/MailBridge.app/Contents/MacOS/MailBridge
+## Completion and paging
+
+Serialize calls. Retain the complete command result; if it returns a session handle, collect all chunks from that same session. Parse only after exit 0 and require `ok: true`. Truncation, missing terminal results and unknown outcomes cannot advance state. Use a sufficiently large output budget, or a private temporary response file removed after parsing; never leave a raw-mail log. Keep waits within 60 seconds.
+
+Start with:
+```json
+{"action":"message.scan","limit":200,"previewCharacters":800}
 ```
 
-## Read workflow
+The response contains `messages`, `state`, `rules`, and string-valued `details` (`since`, `until`, `hasMore`, `nextOffset`). Keep the same `since`/`until`/limit on later pages and pass `offset: nextOffset` until `hasMore: "false"`. Keep a run-level fingerprint set to handle duplicates across pages.
 
-- `{"action":"status"}` checks Apple Mail access and lists enabled accounts.
-- `{"action":"state.status"}` returns cursors, pending count, shadow-run count, and the real-flag gate.
-- `{"action":"rule.list"}` returns explicit sender/domain/subject overrides.
-- `{"action":"message.scan","limit":200,"previewCharacters":800}` returns the first page of unprocessed inbox messages. Omit `since` to use the first-run/cursor policy.
-- Freeze the returned `details.since` and `details.until`. While `details.hasMore` is `true`, request the next page with the same `since`/`until`, `offset` set to `details.nextOffset`, and the same `limit`/`previewCharacters`.
-- Deduplicate fingerprints across the entire run, not only within one page. New mail arriving after the frozen `until` is deliberately left for the next run.
-- `{"action":"message.read","ref":{"accountId":"...","libraryId":1},"maxBodyCharacters":8000}` returns one sanitized body plus attachment metadata.
+The first run covers 24 hours; later runs overlap stored per-account cursors by 15 minutes. Disabled/orphan cursors remain stored but do not widen the window. Metadata is deduplicated before previews; `previewCharacters: 0` fetches no body.
 
-Each message contains `ref`, `receivedAt`, `sender`, `subject`, `sanitizedText`, current `flagIndex`, a stable `fingerprint`, and a conservative `hint`. The hint is not the final classification.
+Messages contain `ref`, `receivedAt`, `sender`, `subject`, sanitized preview, fingerprint and a classification hint. The hint is not the final classification. For body/attachment metadata:
+```json
+{"action":"message.read","ref":{"accountId":"...","libraryId":1},"maxBodyCharacters":8000}
+```
+
+Increase the body limit up to 40,000 when needed; disclose remaining incompleteness. Mail events time out after 30 seconds; scan checks a 60-second budget between events. A failed page is never a complete scan.
 
 ## Attachments
 
-Use `attachment.export` with a message `ref` and `attachmentId`. The bridge rejects unsafe types, files over 10 MB, or messages whose attachments exceed 20 MB. The response contains a path and `cleanupToken`. After inspection, always call:
+`attachment.export` takes `ref` and `attachmentId`, returning `attachment.path` and `attachment.cleanupToken`. Inspect that file and always finish with `attachment.cleanup` plus `cleanupToken`.
 
+Allowed extensions: png, jpg/jpeg, pdf, csv, tsv, txt, md, docx, xlsx. Empty MIME can be inferred from these exact extensions; a nonempty MIME must match. Limit: 10 MB/file, 20 MB/message. Never execute attachments or inspect archives/macros. Read responses expose effective MIME/inference or rejection reason. An intentional policy rejection is a reportable content limitation, not a system fault to bypass.
+
+## State and explicit mutations
+
+After the frozen window is fully classified and the report is ready, call:
 ```json
-{"action":"attachment.cleanup","cleanupToken":"..."}
+{"action":"state.record","state":{"processed":[],"candidates":[],"cursors":[]}}
 ```
 
-Never execute an attachment or inspect archives/macros.
+- `processed`: ref, fingerprint, receivedAt, final category, optional candidateId.
+- `candidates`: each record has top-level `id`, `kind`, `title`, `accountId`, `libraryId`, `sourceSubject`; account/source fields are not nested under `ref` or `source`. Optional fields are start/end/due/location/short notes. Do not store raw bodies.
+- `cursors`: accountId and greatest successfully processed receivedAt. Do not advance an incomplete account/window.
 
-## Flags
+The write is atomic, validates enabled accounts and preserves monotonic cursors. Reimporting a candidate preserves its accepted/dismissed status.
 
-Pass `flags` as message references plus semantic colors (`orange` or `red`).
+`state.pending` returns pending candidates. `candidate.resolve` takes `candidateIds`, `candidateStatus` (accepted/dismissed) and `confirmed: true`; the user's clear natural-language instruction supplies confirmation.
 
-- `flag.preview` is read-only and reports `would_flag` or `preserved_existing`.
-- `flag.commit` additionally requires `confirmed: true` and a previously enabled state gate. It returns a `batchId`.
-- `flag.rollback` requires that `batchId` and `confirmed: true`. It refuses to overwrite a flag the user changed after the batch.
+`rule.upsert` takes `rule` (field: sender/domain/subject, pattern, category) and `confirmed: true`, after an explicit future-rule request.
 
-## State
-
-After all pages report `hasMore: false` and the report is ready, call `state.record` with:
-
-- `processed`: message ref, fingerprint, receivedAt, final category, optional candidate ID.
-- `candidates`: stable candidate records; do not include raw message bodies.
-- `cursors`: maximum successfully processed receivedAt per account. Never advance them for a partial page sequence, parsing failure, or failed account.
-- `shadowRunsCompleted`: increment only after a complete scheduled shadow report.
-
-Use `state.pending` to restore candidate details. `candidate.resolve` needs explicit candidate IDs, status, and `confirmed: true`.
-
-Enabling real flags uses `state.record` with `flaggingEnabled: true` and `confirmed: true`; only do this in direct response to the user's explicit approval after the preview and two shadow runs.
-
-Long-term rules support fields `sender`, `domain`, and `subject`. `rule.upsert` requires `confirmed: true` and an explicit “from now on” user instruction.
-
-If any response has `ok: false`, stop that operation, report the error, and do not claim success.
+For diagnosis only: `status` reads Mail access/accounts; `state.status` reads counts/cursors; `rule.list` reads rules. `setup` can open macOS permission prompts. `state.repair` with confirmed orphan `accountIds` removes only those cursors; current and disabled accounts are protected. Neither is a routine triage prerequisite.

@@ -20,10 +20,9 @@ case "${arch}" in
   *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;;
 esac
 
-binary="${project_dir}/.build/release/MailBridge"
-if [[ ! -x "${binary}" ]]; then
-  /usr/bin/swift build -c release --package-path "${project_dir}"
-fi
+/usr/bin/swift build -c release --package-path "${project_dir}"
+build_dir="$(/usr/bin/swift build -c release --show-bin-path --package-path "${project_dir}")"
+binary="${build_dir}/MailBridge"
 
 staging_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/apple-mail-triage.XXXXXX")"
 trap '/bin/rm -rf "${staging_root}"' EXIT

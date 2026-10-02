@@ -15,6 +15,7 @@ Priority is risk first, then action by explicit deadline, committed schedule, in
 - Create an event candidate only for an actual commitment or response-required invitation. A seminar, club event, sale, or newsletter with a date is not enough.
 - Create a reminder candidate for a task or deadline. Preserve an explicit date/time exactly in `Asia/Singapore`.
 - If a task has no due date, keep `due` absent and label it “缺少日期”; never invent 24 hours or seven days.
+- If the source gives an action window instead of one deadline, use its explicit first day as the reminder candidate date, label it as the opening of the window, and retain the complete range and available hours. Do not describe it as a deadline.
 - Candidate IDs use `E-YYYYMMDD-XXXXXXXX` for events and `T-YYYYMMDD-XXXXXXXX` for reminders. Prefer the bridge/core stable ID when available.
 - Keep candidate notes short: why it is actionable plus the source sender/subject. Do not copy the raw body.
 

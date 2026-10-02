@@ -1,0 +1,7 @@
+{
+  "roles": {
+    "triage": {"model": "gpt-6-luna", "reasoning_effort": "max"},
+    "dispatcher": {"model": "gpt-6-luna", "reasoning_effort": "max"},
+    "repair": {"model": "gpt-6-astra", "reasoning_effort": "medium"}
+  }
+}
