@@ -87,6 +87,13 @@ package final class StateStore {
         path TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS body_failures (
+        account_id TEXT NOT NULL,
+        library_id INTEGER NOT NULL,
+        received_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        PRIMARY KEY(account_id, library_id)
+      );
       """)
   }
 
@@ -102,11 +109,13 @@ package final class StateStore {
       }
       return result
     }
-    return StateSummary(
+    var result = StateSummary(
       processedCount: processedCount,
       pendingCandidateCount: pendingCount,
       cursors: cursors
     )
+    result.deferredBodyCount = try scalarInt("SELECT COUNT(*) FROM body_failures;")
+    return result
   }
 
   func record(_ update: StateUpdate, enabledAccountIds: Set<String>) throws {
@@ -123,6 +132,9 @@ package final class StateStore {
     try transaction {
       let now = DateCodec.string(Date())
       for record in update.processed ?? [] {
+        guard try !hasBodyFailure(record.ref) else {
+          throw MailBridgeError.invalidRequest("正文尚未读取，不能将该邮件标记已处理。")
+        }
         try withStatement(
           """
           INSERT INTO processed_messages(
@@ -148,6 +160,13 @@ package final class StateStore {
       }
       for candidate in update.candidates ?? [] { try upsertCandidate(candidate, now: now) }
       for cursor in update.cursors ?? [] {
+        // A later successful message must never move the cursor past unread mail.
+        let blockedAt = try withStatement("SELECT MIN(julianday(received_at)) FROM body_failures WHERE account_id = ?;") { statement -> Date? in
+          bind(cursor.accountId, 1, statement)
+          guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+          return Date(timeIntervalSince1970: (sqlite3_column_double(statement, 0) - 2440587.5) * 86400 - 1)
+        }
+        let effective = blockedAt.map { min(DateCodec.date(cursor.receivedAt)!, $0) } ?? DateCodec.date(cursor.receivedAt)!
         try withStatement(
           """
           INSERT INTO cursors(account_id, received_at, updated_at) VALUES(?, ?, ?)
@@ -160,7 +179,7 @@ package final class StateStore {
           """
         ) { statement in
           bind(cursor.accountId, 1, statement)
-          bind(cursor.receivedAt, 2, statement)
+          bind(DateCodec.string(effective), 2, statement)
           bind(now, 3, statement)
           try stepDone(statement)
         }
@@ -308,6 +327,43 @@ package final class StateStore {
       try stepDone(statement)
     }
     return token
+  }
+
+  func bodyFailure(_ message: MailMessage, reason: String) throws {
+    try withStatement("INSERT OR REPLACE INTO body_failures(account_id, library_id, received_at, reason) VALUES(?, ?, ?, ?);") { statement in
+      bind(message.ref.accountId, 1, statement)
+      sqlite3_bind_int64(statement, 2, message.ref.libraryId)
+      bind(message.receivedAt, 3, statement)
+      bind(reason, 4, statement)
+      try stepDone(statement)
+    }
+  }
+
+  func hasBodyFailure(_ ref: MessageRef) throws -> Bool {
+    try withStatement("SELECT 1 FROM body_failures WHERE account_id = ? AND library_id = ?;") { statement in
+      bind(ref.accountId, 1, statement)
+      sqlite3_bind_int64(statement, 2, ref.libraryId)
+      return sqlite3_step(statement) == SQLITE_ROW
+    }
+  }
+
+  func clearBodyFailure(_ ref: MessageRef) throws {
+    try withStatement("DELETE FROM body_failures WHERE account_id = ? AND library_id = ?;") { statement in
+      bind(ref.accountId, 1, statement)
+      sqlite3_bind_int64(statement, 2, ref.libraryId)
+      try stepDone(statement)
+    }
+  }
+
+  func expiredExports(before: Date) throws -> [(String, String)] {
+    try withStatement("SELECT token, path FROM temp_exports WHERE julianday(created_at) < julianday(?);") { statement in
+      bind(DateCodec.string(before), 1, statement)
+      var result: [(String, String)] = []
+      while sqlite3_step(statement) == SQLITE_ROW {
+        if let token = text(statement, 0), let path = text(statement, 1) { result.append((token, path)) }
+      }
+      return result
+    }
   }
 
   func exportPath(token: String) throws -> String {

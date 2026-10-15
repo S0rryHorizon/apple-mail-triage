@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Small, deterministic state helper for the Codex-managed mail workflow.
 
-JSON request on stdin, JSON result on stdout. No mail content, credentials, model
-API client, scheduler, or watchdog lives here. App operations remain App tools.
+JSON request on stdin, JSON result on stdout. Bridge responses pass through memory;
+only operational metadata is saved. App operations remain App tools.
 """
 import contextlib
 import datetime as dt
@@ -21,6 +21,85 @@ ROOT = Path(__file__).resolve().parents[1]
 ZONE = ZoneInfo("Asia/Singapore")
 RECEIPT = "本次整理完成，暂无需要关注的新内容。"
 EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+CLEANUP_STAGES = {"cleanup.archive", "dispatcher_cleanup", "archive"}
+NON_REPAIR_CODES = {
+    "request_validation", "permission_required", "permission_denied", "confirmation_required",
+    "not_found", "attachment_limitation", "attachment_rejected", "attachment_policy_rejected",
+    "attachment_conversion_failed", "source_size_limit", "mail_body_size_limit",
+    "body_decode_failed", "body_not_read", "source_body_missing",
+}
+BRIDGE_ACTIONS = {"message.scan", "message.read", "attachment.text", "attachment.export",
+                  "attachment.cleanup", "state.status", "state.pending", "rule.list", "state.record"}
+
+
+def bridge_result(returncode, output):
+    """A process exit and a bridge outcome are separate evidence, not prose."""
+    try:
+        response = json.loads(output)
+    except (ValueError, UnicodeError):
+        response = None
+    if isinstance(response, dict):
+        if response.get("ok") is True and returncode == 0:
+            return {"outcome": "succeeded", "bridge": response, "exit_code": returncode}
+        code = response.get("errorCode")
+        if response.get("ok") is False and isinstance(code, str) and re.fullmatch(r"[a-z0-9_.-]{1,96}", code):
+            bridge = {"ok": False, "status": "error", "errorCode": code}
+            details = response.get("details")
+            diagnostics = {}
+            if isinstance(details, dict):
+                allowed = {
+                    "operation": {"accounts", "metadata", "source", "rendered_body", "message_metadata", "attachment_export", "source_decode"},
+                    "reason": {"scan_deadline", "apple_event_timeout", "script_compile", "apple_script_error"},
+                }
+                for key, values in allowed.items():
+                    if isinstance(details.get(key), str) and details[key] in values:
+                        diagnostics[key] = details[key]
+                for key in ("apple_error_number", "elapsed_ms"):
+                    value = details.get(key)
+                    if isinstance(value, str) and re.fullmatch(r"-?[0-9]{1,10}", value):
+                        diagnostics[key] = value
+            if diagnostics:
+                bridge["details"] = diagnostics
+            if code == "request_validation" and isinstance(response.get("message"), str):
+                bridge["message"] = response["message"][:1000]
+            return {"outcome": "failed", "error_code": code, "exit_code": returncode,
+                    "bridge": bridge, **({"diagnostics": diagnostics} if diagnostics else {})}
+    return {"outcome": "failed" if returncode else "unknown", "exit_code": returncode,
+            "error_code": "bridge_invalid_response"}
+
+
+def cleanup_incident(incident):
+    return incident.get("stage") in CLEANUP_STAGES or bool(incident.get("target_thread_id"))
+
+
+def repair_exclusion(incident):
+    if cleanup_incident(incident):
+        return "cleanup_deferred"
+    if incident.get("error_code") in NON_REPAIR_CODES or incident.get("stage", "").startswith("attachment."):
+        return "content_validation_or_user_action"
+    return None
+
+
+def known_threads(state, registry):
+    ids = {item["threadId"] for item in registry["managedThreads"].values()}
+    ids.update(item["dispatcher_id"] for item in state["runs"].values())
+    for incident in state["incidents"].values():
+        ids.update(incident.get("failed_thread_ids", [incident["failed_thread_id"]]))
+        if incident.get("repair_thread_id"):
+            ids.add(incident["repair_thread_id"])
+        if incident.get("previous_repair_thread_id"):
+            ids.add(incident["previous_repair_thread_id"])
+        if incident.get("previous_week_thread_id"):
+            ids.add(incident["previous_week_thread_id"])
+    return ids
+
+
+def cleanup_outcome(state, target):
+    if target in state["archived"]:
+        return "archived"
+    if target in state.get("missing_threads", {}):
+        return "missing"
+    return "unverified"
 
 
 def atomic_json(path, value):
@@ -120,8 +199,104 @@ class Runtime:
                     "threadId": thread_id(registry["templateThreadId"]),
                     "environment": {"type": "same-directory"}}}
 
+    def bridge_call(self, request):
+        """Execute once, classify the actual result, and persist its run outcome."""
+        payload = dict(request["request"])
+        action = payload.get("action")
+        if action not in BRIDGE_ACTIONS:
+            raise ValueError("后台 bridge.call 不支持此操作")
+        run_id = request["run_id"]
+        owner = thread_id(request["thread_id"])
+        with self.locked():
+            state = self.state()
+            run = state["runs"][run_id]
+            if owner != run["thread_id"]:
+                raise ValueError("只有当前整理任务可以执行本次桥接调用")
+            if not self.active():
+                return {"outcome": "not_run", "reason": "paused", "run_phase": run["phase"]}
+            if run["phase"] not in ("running", "blocked"):
+                return {"outcome": "not_run", "reason": run["phase"], "run_phase": run["phase"]}
+            scan = run.get("scan")
+            if action == "message.scan":
+                if scan:
+                    if scan["complete"]:
+                        raise ValueError("本轮分页已结束；不要重复扫描")
+                    expected = {"since": scan["since"], "until": scan["until"],
+                                "offset": scan["next_offset"], "limit": scan["limit"]}
+                    for key, value in expected.items():
+                        if key in payload and payload[key] != value:
+                            raise ValueError("分页必须沿用已冻结窗口和 nextOffset")
+                        payload[key] = value
+                elif payload.get("offset", 0) != 0:
+                    raise ValueError("首个扫描页必须从 offset 0 开始")
+            if action == "state.record" and not (scan and scan["complete"]):
+                raise ValueError("冻结窗口尚未扫描完毕，不能保存整理结果")
+            executable = os.environ.get("MAILBRIDGE_PATH") or str(Path.home() / "Applications/MailBridge.app/Contents/MacOS/MailBridge")
+            try:
+                process = subprocess.run([executable], input=json.dumps(payload),
+                    capture_output=True, text=True, timeout=90)
+                result = bridge_result(process.returncode, process.stdout)
+                # A broken write response cannot prove whether its transaction committed.
+                if action == "state.record" and result.get("error_code") == "bridge_invalid_response":
+                    result["outcome"] = "unknown"
+            except subprocess.TimeoutExpired:
+                result = {"outcome": "unknown", "error_code": "bridge_timeout"}
+            except OSError:
+                result = {"outcome": "failed", "error_code": "bridge_unavailable"}
+            except UnicodeError:
+                result = {"outcome": "unknown", "error_code": "bridge_invalid_response"}
+            if result["outcome"] == "succeeded":
+                response = result["bridge"]
+                if action == "message.scan":
+                    details = response.get("details", {})
+                    try:
+                        since, until = details["since"], details["until"]
+                        timestamp(since), timestamp(until)
+                        next_offset = int(details["nextOffset"])
+                        complete = details["hasMore"] == "false"
+                        if details["hasMore"] not in ("true", "false") or next_offset < payload.get("offset", 0):
+                            raise ValueError("Invalid page")
+                        if not complete and next_offset <= payload.get("offset", 0):
+                            raise ValueError("Page did not advance")
+                        if scan and (since, until) != (scan["since"], scan["until"]):
+                            raise ValueError("Window changed")
+                        run["scan"] = {"since": since, "until": until, "next_offset": next_offset,
+                                       "complete": complete, "limit": min(max(payload.get("limit", 200), 1), 1000)}
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        result = {"outcome": "unknown", "error_code": "bridge_invalid_response"}
+                elif action == "state.record":
+                    summary = response.get("state")
+                    count = summary.get("deferredBodyCount") if isinstance(summary, dict) else None
+                    if type(count) is not int or count < 0 or response.get("status") != "recorded":
+                        result = {"outcome": "unknown", "error_code": "bridge_invalid_response"}
+                    else:
+                        run.update(phase="partial" if count else "recorded", deferred_body_count=count,
+                                   ended_at=timestamp().isoformat())
+            if result["outcome"] == "succeeded":
+                if action != "state.record":
+                    run["phase"] = "running"
+                    run.pop("ended_at", None)
+            else:
+                run.update(phase="unknown" if result["outcome"] == "unknown" else
+                           "blocked" if repair_exclusion({"stage": action, "error_code": result["error_code"]}) else "failed",
+                           ended_at=timestamp().isoformat())
+            run["last_bridge"] = {"action": action, "at": timestamp().isoformat(),
+                                  **{key: result[key] for key in ("outcome", "error_code", "exit_code", "diagnostics") if key in result}}
+            self.save(state)
+            result["run_phase"] = run["phase"]
+        if result["outcome"] == "failed":
+            result["recovery"] = self.handle({"action": "incident.open", "run_id": run_id,
+                "thread_id": owner, "stage": action, "error_code": result["error_code"], "outcome": "failed"})
+        return result
+
     def handle(self, request):
         action = request["action"]
+        if action == "bridge.call":
+            return self.bridge_call(request)
+        if action == "cleanup.failed":
+            request = {**request, "stage": "cleanup.archive",
+                       "error_code": request.get("error_code", "archive_failed")}
+            action = "incident.open"
         with self.locked():
             if action == "config.get":
                 return self.config()
@@ -175,6 +350,10 @@ class Runtime:
                 target = registry["managedThreads"].get(week)
                 if target and target.get("setupState", "ready") != "ready":
                     raise ValueError("本周任务创建未完成，需恢复原任务，不能另建副本")
+                # A manually restarted dispatcher is active again even if a
+                # previous run of that same chat was successfully archived.
+                state["archived"] = [value for value in state["archived"] if value != owner]
+                state.get("missing_threads", {}).pop(owner, None)
                 state["runs"][run_id] = {"week": week, "title": title, "planned_at": planned.isoformat(),
                     "started_at": now.isoformat(), "dispatcher_id": owner,
                     "thread_id": target["threadId"] if target else None, "phase": "prepared", "retries": 0}
@@ -190,7 +369,7 @@ class Runtime:
                 return result
             if action == "run.get":
                 return state["runs"][request["run_id"]]
-            if action in ("week.register", "triage.begin", "dispatch.delivered", "triage.recorded"):
+            if action in ("week.register", "triage.begin", "dispatch.delivered", "triage.recorded", "triage.partial"):
                 run = state["runs"][request["run_id"]]
                 if action == "triage.begin" and not self.active():
                     return {"should_run": False, "reason": "paused"}
@@ -220,47 +399,111 @@ class Runtime:
                     if entry and entry["threadId"] == run["thread_id"]:
                         entry["setupState"] = "ready"
                         atomic_json(self.registry_path, registry)
-                elif action == "triage.recorded":
+                elif action in ("triage.recorded", "triage.partial"):
                     if thread_id(request["thread_id"]) != run["thread_id"]:
                         raise ValueError("只有当前整理任务可以记录完成")
                     if run["phase"] != "running" or request.get("state_recorded") is not True:
                         raise ValueError("只有完成整理且成功保存状态后才能记录完成")
-                    run["phase"] = "recorded"
+                    if action == "triage.partial":
+                        count = request.get("deferred_body_count")
+                        if type(count) is not int or count < 1:
+                            raise ValueError("部分整理需要真实的待处理正文数量")
+                        run.update(phase="partial", deferred_body_count=count)
+                    else:
+                        run["phase"] = "recorded"
                 self.save(state)
-                return {"should_run": True, "run": run, "receipt": RECEIPT}
+                return {"should_run": True, "run": run, "receipt": None if run["phase"] == "partial" else RECEIPT}
             if action == "cleanup.plan":
                 run = state["runs"][request["run_id"]]
                 previous = week_info(timestamp(run["planned_at"]) - dt.timedelta(days=7))[0]
                 ids = [item["threadId"] for week, item in registry["managedThreads"].items() if week < previous]
                 ids += [item["dispatcher_id"] for item in state["runs"].values()
-                        if item["phase"] in ("delivered", "running", "recorded", "completed")]
-                protected = {item["thread_id"] for item in state["runs"].values() if item["phase"] == "running"}
+                        if item["phase"] in ("delivered", "running", "partial", "recorded", "completed")]
+                ids += [item["repair_thread_id"] for item in state["incidents"].values()
+                        if item["status"] == "resolved" and item.get("repair_archive_pending")
+                        and item.get("repair_thread_id")]
+                # A later successful run in the same weekly task supersedes a
+                # stale running marker for cleanup only; it does not prove the
+                # older run completed. Keep newer running work protected.
+                successful = {}
+                for item in state["runs"].values():
+                    if item["phase"] in ("recorded", "completed"):
+                        owner = item["thread_id"]
+                        when = timestamp(item["started_at"])
+                        successful[owner] = max(successful.get(owner, when), when)
+                protected = {item["thread_id"] for item in state["runs"].values()
+                             if item["phase"] == "running" and (
+                                 item["thread_id"] not in successful or
+                                 timestamp(item["started_at"]) >= successful[item["thread_id"]])}
+                blocked = set()
                 for incident in state["incidents"].values():
                     if incident["status"] != "resolved":
                         protected.update(incident.get("failed_thread_ids", [incident["failed_thread_id"]]))
+                        if incident.get("target_thread_id"):
+                            blocked.add(incident["target_thread_id"])
                         if incident.get("previous_week_thread_id"):
                             protected.add(incident["previous_week_thread_id"])
-                return {"thread_ids": sorted(set(ids) - set(state["archived"]) - protected - {request["thread_id"]})}
+                remaining = set(ids) - set(state["archived"]) - set(state.get("missing_threads", {}))
+                return {"thread_ids": sorted(remaining - protected - blocked - {request["thread_id"]}),
+                        "blocked_thread_ids": sorted(remaining & blocked)}
             if action == "cleanup.record":
-                owner = thread_id(request["thread_id"])
-                known = {x["threadId"] for x in registry["managedThreads"].values()}
-                known |= {x["dispatcher_id"] for x in state["runs"].values()}
-                for incident in state["incidents"].values():
-                    known.update(incident.get("failed_thread_ids", [incident["failed_thread_id"]]))
-                    if incident.get("previous_week_thread_id"):
-                        known.add(incident["previous_week_thread_id"])
-                if owner not in known:
+                owner = thread_id(request.get("target_thread_id") or request["thread_id"])
+                if owner not in known_threads(state, registry):
                     raise ValueError("不管理未知任务")
-                state["archived"] = sorted(set(state["archived"]) | {owner})
+                outcome = request.get("outcome", "archived")
+                if outcome == "archived":
+                    state["archived"] = sorted(set(state["archived"]) | {owner})
+                    state.get("missing_threads", {}).pop(owner, None)
+                    for incident in state["incidents"].values():
+                        if incident.get("repair_thread_id") == owner:
+                            incident.pop("repair_archive_pending", None)
+                elif outcome == "missing":
+                    incident = state["incidents"][request["incident_id"]]
+                    # The caller must verify both local sources. An App lookup
+                    # error (including a durable-host error) alone proves neither.
+                    verification = request.get("verification", {})
+                    if (not cleanup_incident(incident) or incident.get("target_thread_id") != owner
+                            or verification.get("host_id") != "local"
+                            or verification.get("index_absent") is not True
+                            or verification.get("rollout_absent") is not True):
+                        raise ValueError("必须核实原归档目标在本地索引和会话文件中均不存在")
+                    latest = max(timestamp(item["planned_at"]) for item in state["runs"].values())
+                    previous = week_info(latest - dt.timedelta(days=7))[0]
+                    retained = {item["threadId"] for week, item in registry["managedThreads"].items()
+                                if week >= previous}
+                    retained.update(item["thread_id"] for item in state["runs"].values()
+                                    if item["phase"] == "running")
+                    if owner in retained or owner == registry.get("templateThreadId"):
+                        raise ValueError("不能移除保留中或正在运行的任务引用")
+                    if owner in state["archived"]:
+                        raise ValueError("已确认归档的任务不能改记为不存在")
+                    state.setdefault("missing_threads", {})[owner] = {
+                        "host_id": "local", "verified_at": timestamp().isoformat(),
+                        "verification": "local_index_and_rollout_absent"}
+                else:
+                    raise ValueError("cleanup.record 仅接受已确认的 archived 或 missing")
                 self.save(state)
-                return {"archived": owner}
+                return {outcome: owner}
             if action == "incident.open":
                 if request.get("outcome") not in ("failed", "unavailable"):
                     return {"repair": False, "reason": "结果未知或业务问题，不自动接管"}
                 code = request["error_code"]
                 if not re.fullmatch(r"[a-z0-9_.-]{1,96}", code):
                     raise ValueError("error_code 只保存简短错误类型，不保存原始输出或邮件内容")
-                key = request["stage"] + ":" + code
+                stage = request["stage"]
+                is_cleanup = cleanup_incident(request)
+                exclusion = repair_exclusion(request)
+                if exclusion and not is_cleanup:
+                    return {"repair": False, "reason": exclusion}
+                target = None
+                if is_cleanup:
+                    if not request.get("target_thread_id"):
+                        raise ValueError("归档故障必须记录实际 target_thread_id")
+                    target = thread_id(request["target_thread_id"])
+                    if request.get("target_host_id", "local") != "local" or target not in known_threads(state, registry):
+                        raise ValueError("归档目标必须是已登记的本地受管任务")
+                    stage = "cleanup.archive"
+                key = "cleanup.archive:local:" + target if is_cleanup else stage + ":" + code
                 owner = thread_id(request["thread_id"])
                 run_id = request.get("run_id")
                 if not run_id:
@@ -272,27 +515,42 @@ class Runtime:
                         "dispatcher_id": owner, "thread_id": registry["managedThreads"].get(week, {}).get("threadId"),
                         "phase": "failed", "retries": 0}
                 run = state["runs"][run_id]
-                if owner not in (run["thread_id"], run["dispatcher_id"]):
+                is_repairer = is_cleanup and any(
+                    item.get("repair_thread_id") == owner and item["run_id"] == run_id
+                    for item in state["incidents"].values())
+                if owner not in (run["thread_id"], run["dispatcher_id"]) and not is_repairer:
                     raise ValueError("故障任务不属于本次运行")
-                if run["phase"] not in ("recorded", "completed") and (
+                if not is_cleanup and run["phase"] not in ("recorded", "completed") and (
                     owner == run["thread_id"] or run["phase"] not in ("delivered", "running")
                 ):
                     run["phase"] = "failed"
                 for incident in state["incidents"].values():
-                    if (incident["key"] == key or incident["run_id"] == run_id) and incident["status"] != "resolved":
+                    if is_cleanup:
+                        same_incident = cleanup_incident(incident) and incident.get("target_thread_id") == target
+                    else:
+                        same_incident = not cleanup_incident(incident) and (
+                            incident["key"] == key or incident["run_id"] == run_id)
+                    if same_incident and incident["status"] != "resolved":
                         incident["failed_thread_ids"] = sorted(set(incident.get("failed_thread_ids", [incident["failed_thread_id"]])) | {owner})
                         self.save(state)
                         return {"repair": False, "incident": incident}
                 incident_id = "R-" + uuid.uuid4().hex[:12]
                 incident = {"id": incident_id, "key": key, "run_id": run_id,
-                    "failed_thread_id": owner, "failed_thread_ids": [owner], "stage": request["stage"], "error_code": code,
+                    "failed_thread_id": owner, "failed_thread_ids": [owner], "stage": stage, "error_code": code,
                     "status": "open", "attempts": 0, "created_at": timestamp().isoformat()}
+                failure = state["runs"][run_id].get("last_bridge", {})
+                if failure.get("action") == stage and failure.get("error_code") == code and failure.get("diagnostics"):
+                    incident["diagnostics"] = failure["diagnostics"]
+                if is_cleanup:
+                    incident.update(target_thread_id=target, target_host_id="local")
                 state["incidents"][incident_id] = incident
                 self.save(state)
-                return {"repair": True, "incident": incident}
+                return {"repair": exclusion is None, "reason": exclusion, "incident": incident}
             if action == "repair.prepare":
                 incident = state["incidents"][request["incident_id"]]
-                if not self.active() or incident["attempts"]:
+                if reason := repair_exclusion(incident):
+                    return {"launch": False, "reason": reason, "incident": incident}
+                if not self.active() or incident["attempts"] or incident["status"] != "open":
                     return {"launch": False, "incident": incident}
                 incident.update(attempts=1, status="launching")
                 self.save(state)
@@ -304,12 +562,30 @@ class Runtime:
             if action == "repair.get":
                 incident = state["incidents"][request["incident_id"]]
                 return {"incident": incident, "run": state["runs"][incident["run_id"]],
-                        "active": self.active(), "template_id": registry.get("templateThreadId")}
+                        "active": self.active(), "template_id": registry.get("templateThreadId"),
+                        "target_outcome": cleanup_outcome(state, incident.get("target_thread_id"))
+                        if cleanup_incident(incident) else None}
             if action == "repair.attach":
                 incident = state["incidents"][request["incident_id"]]
                 owner = thread_id(request["thread_id"])
+                manual = request.get("manual") is True
+                if manual and request.get("confirmed") is not True:
+                    raise ValueError("在现有对话中接管修复需要用户明确授权")
+                run = state["runs"][incident["run_id"]]
+                takeover = (manual and incident["status"] == "failed" and self.active()
+                            and run["phase"] == "failed" and not run["retries"]
+                            and repair_exclusion(incident) is None)
+                if takeover:
+                    incident["previous_repair_thread_id"] = incident.get("repair_thread_id")
+                    incident.update(repair_thread_id=owner, status="running", manual=True)
+                    self.save(state)
+                    return incident
                 if incident.get("repair_thread_id") not in (None, owner) or incident["status"] not in ("launching", "running"):
                     raise ValueError("修复任务已存在或本次修复已结束")
+                if request.get("manual") is True:
+                    if request.get("confirmed") is not True:
+                        raise ValueError("在现有对话中接管修复需要用户明确授权")
+                    incident["manual"] = True
                 incident.update(repair_thread_id=owner, status="running")
                 self.save(state)
                 return incident
@@ -318,6 +594,8 @@ class Runtime:
                 run = state["runs"][incident["run_id"]]
                 if not self.active() or incident["status"] != "running":
                     return {"retry": False, "reason": "paused_or_inactive"}
+                if cleanup_incident(incident):
+                    return {"retry": False, "reason": "cleanup_only", "thread_id": run["thread_id"]}
                 if run["phase"] in ("recorded", "completed"):
                     return {"retry": False, "reason": "already_recorded", "thread_id": run["thread_id"]}
                 if run["phase"] in ("delivered", "running"):
@@ -325,6 +603,9 @@ class Runtime:
                 if run["retries"]:
                     return {"retry": False, "reason": "retry_used"}
                 run.update(retries=1, phase="retry_ready")
+                run.pop("scan", None)
+                run.pop("last_bridge", None)
+                run.pop("ended_at", None)
                 if request.get("replacement_thread_id"):
                     owner = thread_id(request["replacement_thread_id"])
                     old = registry["managedThreads"].get(run["week"])
@@ -345,9 +626,18 @@ class Runtime:
                 success = request.get("success") is True
                 if success and (run["phase"] not in ("recorded", "completed") or request.get("report_delivered") is not True):
                     raise ValueError("尚未确认状态保存和报告输出成功")
+                if success and cleanup_incident(incident):
+                    outcome = cleanup_outcome(state, incident.get("target_thread_id"))
+                    if outcome == "unverified":
+                        raise ValueError("原归档目标尚未确认已归档或本地引用已不存在")
+                    incident["resolution"] = "target_" + outcome
                 incident["status"] = "resolved" if success else "failed"
-                if success:
+                if success and not cleanup_incident(incident):
                     run["phase"] = "completed"
+                if success:
+                    incident["resolved_at"] = timestamp().isoformat()
+                    if not incident.get("manual") and incident.get("repair_thread_id") and incident["repair_thread_id"] not in state["archived"]:
+                        incident["repair_archive_pending"] = True
                 self.save(state)
                 # Never archive the live weekly task when it was recovered in place.
                 ids = incident.get("failed_thread_ids", [incident["failed_thread_id"]])[:] if success else []
@@ -362,6 +652,8 @@ class Runtime:
         with self.locked():
             state = self.state()
             incident = state["incidents"][incident_id]
+            if reason := repair_exclusion(incident):
+                return {"started": False, "reason": reason, "incident": incident}
             if not self.active() or incident["status"] != "launching" or incident.get("repair_thread_id") or incident.get("cli_pid"):
                 return {"started": False, "incident": incident}
             worker = [sys.executable, str(Path(__file__).resolve()), "--repair-worker", incident_id]
@@ -376,6 +668,10 @@ class Runtime:
             return {"started": True, "pid": process.pid, "incident_id": incident_id}
 
     def cli_worker(self, incident_id, executable=None):
+        with self.locked():
+            incident = self.state()["incidents"][incident_id]
+            if repair_exclusion(incident):
+                return
         role = self.config()["roles"]["repair"]
         executable = executable or os.environ.get("CODEX_CLI_PATH", "codex")
         prompt = (f"用户已授权邮箱自动修复。故障 ID：{incident_id}。"

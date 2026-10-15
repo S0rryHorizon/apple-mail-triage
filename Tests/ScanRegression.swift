@@ -29,6 +29,13 @@ final class FakeMail {
   var failAccounts = false
   var failMetadata = false
   var failBody = false
+  var bodies: [Int: String] = [:]
+  var renderedBodies: [Int: String] = [:]
+  var renderedReads: [Int] = []
+  var failRenderedBody = false
+  var attachmentName: String?
+  var attachmentData = Data()
+  var exportedPath: String?
   var clock = Date()
   var expireAfterMetadata = false
   var compiledScripts = 0
@@ -49,19 +56,34 @@ final class FakeMail {
       if expireAfterMetadata { clock = clock.addingTimeInterval(61) }
       return list(Array(rows.dropFirst(offset).prefix(limit)))
     }
-    if source.contains("return content of targetMessage") {
+    if source.contains("return source of targetMessage") {
       let id = number(#"whose id is (\d+)"#, source)
       previews.append(id)
       if failBody { throw MailBridgeError.mailAutomation("synthetic body timeout") }
-      return .init(string: "Please submit by Friday. Your verification code: 123456")
+      if let body = bodies[id] { return .init(string: body) }
+      return .init(string: "Content-Type: text/plain; charset=utf-8\r\n\r\nPlease submit by Friday. Your verification code: 123456")
+    }
+    if source.contains("return content of targetMessage") {
+      let id = number(#"whose id is (\d+)"#, source)
+      renderedReads.append(id)
+      if failRenderedBody { throw MailBridgeError.mailAutomation("synthetic fallback timeout") }
+      return .init(string: renderedBodies[id] ?? "")
     }
     if source.contains("set attachmentOutput") {
       let metadata = rows[0]
       var fields = (1...9).map { metadata.atIndex($0)! }
-      fields.append(list([]))
+      fields.append(list(attachmentName.map { [list([.init(string: "synthetic-attachment"), .init(string: $0), .init(string: ""), .init(int32: Int32(attachmentData.count)), .init(boolean: true)])] } ?? []))
       fields.append(.init(string: ""))
       expect(!source.contains("content of targetMessage"), "Zero-length read fetched a body")
       return list(fields)
+    }
+    if source.contains("save targetAttachment") {
+      let expression = try! NSRegularExpression(pattern: #"save targetAttachment in POSIX file \"([^\"]+)\""#)
+      let match = expression.firstMatch(in: source, range: NSRange(source.startIndex..., in: source))!
+      let path = (source as NSString).substring(with: match.range(at: 1))
+      try attachmentData.write(to: URL(fileURLWithPath: path))
+      exportedPath = path
+      return .init(string: path)
     }
     fatalError("Unexpected Mail operation")
   }, now: { [unowned self] in clock })
@@ -130,6 +152,43 @@ func mustFail(_ action: () throws -> Void) {
   do { try action(); fatalError("Operation incorrectly succeeded") } catch {}
 }
 
+let mime = """
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: multipart/alternative; boundary="inner"
+
+--inner
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+\(Data("实验 reminder\nPlease submit by Friday.".utf8).base64EncodedString())
+--inner
+Content-Type: text/html; charset=utf-8
+
+<p>Alternative version</p>
+--inner--
+--outer
+Content-Type: text/plain
+Content-Disposition: attachment; filename="private.txt"
+
+Attachment must not become body
+--outer--
+"""
+let decoded = try SourceBody.decode(mime)
+expect(decoded == "实验 reminder\nPlease submit by Friday.", "MIME alternative/attachment/charset decoding failed")
+let html = try SourceBody.decode("Content-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: quoted-printable\n\n<head><style>hidden CSS</style></head><p>Hello &amp; welcome</p><script>hidden code</script><p>Deadline =3D Friday<img src='https://example.test/pixel'></p>")
+expect(html.contains("Hello & welcome") && html.contains("Deadline = Friday"), "HTML text/transfer decoding failed")
+expect(!html.contains("hidden") && !html.contains("pixel"), "HTML code or resource leaked")
+mustFail { _ = try SourceBody.decode("Content-Type: multipart/mixed; boundary=missing\n\nBroken MIME") }
+mustFail { _ = try SourceBody.decode("Content-Type: application/octet-stream\n\nNo text body") }
+let largeAttachmentMIME = "Content-Type: multipart/mixed; boundary=large\n\n--large\nContent-Type: text/plain\n\nSmall body\n--large\nContent-Type: application/octet-stream\nContent-Disposition: attachment; filename=synthetic.bin\nContent-Transfer-Encoding: base64\n\n" + String(repeating: "QUFB\n", count: 2_200_000) + "\n--large--\n"
+let largeAttachmentBody = try SourceBody.decode(largeAttachmentMIME)
+expect(largeAttachmentBody == "Small body", "Large attachment prevented small body decoding")
+mustFail { _ = try SourceBody.decode(String(repeating: "x", count: 40 * 1024 * 1024 + 1)) }
+mustFail { _ = try SourceBody.decode("Content-Type: text/plain\n\n" + String(repeating: "x", count: 10 * 1024 * 1024 + 1)) }
+
 try scenario("dedupe-before-body") { store, mail, service in
   mail.rows = [row(1, messageId: "known@example.test"), row(2, messageId: "known@example.test"), row(3), row(4)]
   try record(store, ["processed": [["ref": ["accountId": "active", "libraryId": 1], "fingerprint": PrivacyFilter.fingerprint(accountId: "active", libraryId: 1, messageId: "known@example.test", receivedAt: "", subject: ""), "receivedAt": "2026-08-19T08:00:00Z", "category": "information"]]])
@@ -142,6 +201,16 @@ try scenario("dedupe-before-body") { store, mail, service in
   expect(response.messages?.first?.hint == .action, "Body did not inform classification")
   let after = try store.summary()
   expect(before == after, "Scan changed state")
+}
+
+try scenario("full-read-source-body") { _, mail, service in
+  mail.rows = [row(1)]
+  var request = BridgeRequest(action: "message.read")
+  request.ref = MessageRef(accountId: "active", libraryId: 1)
+  request.maxBodyCharacters = 8_000
+  let response = try service.handle(request)
+  expect(response.messages?.first?.sanitizedText?.contains("Please submit") == true, "Full read lost decoded body")
+  expect(response.messages?.first?.sanitizedText?.contains("123456") == false, "Full read skipped privacy filter")
 }
 
 try scenario("metadata-only") { _, mail, service in
@@ -212,4 +281,151 @@ for failure in ["accounts", "metadata", "body", "malformed", "deadline"] {
   }
 }
 
-print("Mail scan: \(checkCount) synthetic scenarios passed; no Apple Mail access")
+try scenario("isolated-body-failure-and-cursor-safety") { store, mail, service in
+  mail.rows = [row(1), row(2, date: "2026-08-20T08:00:00Z")]
+  mail.bodies[1] = "Content-Type: multipart/mixed; boundary=missing\n\nBroken MIME"
+  let response = try service.handle(scan())
+  expect(response.ok && response.status == "partial" && response.messages?.count == 2, "One malformed body stopped the page")
+  expect(response.messages?.first?.sanitizedText?.contains("Please submit") == true, "Healthy body lost")
+  expect(response.messages?.last?.bodyReadError == "body_decode_failed", "Unread body was concealed")
+  let zeroPreview = try service.handle(scan(preview: 0))
+  expect(zeroPreview.messages?.last?.bodyReadError != nil, "Metadata-only scan cleared unread failure")
+  func save(_ ids: [Int]) throws {
+    let processed = response.messages!.filter { ids.contains(Int($0.ref.libraryId)) }.map {
+      ["ref": ["accountId": $0.ref.accountId, "libraryId": $0.ref.libraryId], "fingerprint": $0.fingerprint,
+       "receivedAt": $0.receivedAt, "category": "information"] as [String: Any]
+    }
+    let data = try JSONSerialization.data(withJSONObject: ["action": "state.record", "state": ["processed": processed,
+      "cursors": [["accountId": "active", "receivedAt": "2026-08-20T08:00:00Z"]]]])
+    _ = try service.handle(JSONDecoder().decode(BridgeRequest.self, from: data))
+  }
+  mustFail { try save([1, 2]) }
+  expect(try! store.summary().processedCount == 0, "Rejected save partially committed")
+  try save([2])
+  let saved = try store.summary()
+  expect(saved.processedCount == 1 && saved.deferredBodyCount == 1, "Healthy mail was not saved separately")
+  expect(DateCodec.date(saved.cursors[0].receivedAt)! < DateCodec.date("2026-08-19T08:00:00Z")!, "Cursor skipped unread mail")
+  mail.bodies.removeValue(forKey: 1)
+  let next = try service.handle(scan())
+  expect(next.messages?.count == 1 && next.messages?[0].ref.libraryId == 1, "Unread mail was lost or healthy mail repeated")
+  try save([1])
+  expect(try! store.summary().deferredBodyCount == 0, "Successful reread did not clear pending failure")
+}
+
+try scenario("header-only-source-uses-rendered-body") { store, mail, service in
+  mail.rows = [row(1), row(2)]
+  mail.bodies[1] = "Content-Type: multipart/mixed; boundary=missing\r\n\r\n"
+  mail.renderedBodies[1] = "Confirmed appointment. Verification code: 123456"
+  let response = try service.handle(scan())
+  let recovered = response.messages!.first { $0.ref.libraryId == 1 }!
+  expect(recovered.bodyReadError == nil && recovered.sanitizedText!.contains("Confirmed appointment"), "Available rendered body was lost")
+  expect(!recovered.sanitizedText!.contains("123456"), "Fallback bypassed privacy filter")
+  expect(mail.renderedReads == [1], "Healthy MIME used rendered fallback")
+  expect(try! store.summary().deferredBodyCount == 0, "Recovered body remained deferred")
+  mail.renderedBodies[1] = " \n"
+  let unread = try service.handle(scan()).messages!.first { $0.ref.libraryId == 1 }!
+  expect(unread.bodyReadError == "source_body_missing", "Empty fallback was accepted as a complete body")
+  expect(try! store.summary().deferredBodyCount == 1, "Unavailable fallback was not retained")
+}
+
+try scenario("rendered-body-timeout-remains-operational") { store, mail, service in
+  mail.rows = [row(1)]
+  mail.bodies[1] = "Content-Type: multipart/mixed; boundary=missing\n\n"
+  mail.failRenderedBody = true
+  let before = try store.summary()
+  mustFail { _ = try service.handle(scan()) }
+  expect(try! store.summary() == before, "Timed-out fallback advanced state")
+}
+
+try scenario("invalid-charset-does-not-use-rendered-fallback") { _, mail, service in
+  mail.rows = [row(1)]
+  mail.bodies[1] = "Content-Type: text/plain; charset=unknown-synthetic-charset\n\ntext"
+  mail.renderedBodies[1] = "Must not bypass malformed MIME"
+  let response = try service.handle(scan())
+  expect(response.messages?.first?.bodyReadError == "body_decode_failed", "Malformed body was silently accepted")
+  expect(mail.renderedReads.isEmpty, "Unrelated decoder error triggered fallback")
+}
+
+try scenario("attachment-text-cleans-success-and-failure") { store, mail, service in
+  mail.rows = [row(1)]
+  mail.attachmentName = "synthetic.txt"
+  mail.attachmentData = Data("Synthetic attachment. Verification code: 123456\n".utf8)
+  var request = BridgeRequest(action: "attachment.text")
+  request.ref = MessageRef(accountId: "active", libraryId: 1)
+  request.attachmentId = "synthetic-attachment"
+  request.maxBodyCharacters = 200
+  let result = try service.handle(request)
+  expect(result.text?.contains("Synthetic attachment") == true && result.text?.contains("123456") == false, "Text extraction or privacy filter failed")
+  expect(result.details?["cleanup"] == "cleaned", "Cleanup was not confirmed")
+  expect(!FileManager.default.fileExists(atPath: URL(fileURLWithPath: mail.exportedPath!).deletingLastPathComponent().path), "Successful conversion left attachment")
+  let fixtures = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MAIL_TRIAGE_TEST_FIXTURES"]!)
+  for ext in ["pdf", "docx", "xlsx"] {
+    mail.attachmentName = "synthetic.\(ext)"
+    mail.attachmentData = try Data(contentsOf: fixtures.appendingPathComponent(mail.attachmentName!))
+    let converted = try service.handle(request)
+    expect(converted.text?.contains("Synthetic") == true, "\(ext) text extraction failed")
+    expect(!FileManager.default.fileExists(atPath: URL(fileURLWithPath: mail.exportedPath!).deletingLastPathComponent().path), "\(ext) conversion left attachment")
+  }
+  mail.attachmentName = "long.txt"
+  mail.attachmentData = Data(String(repeating: "Synthetic text. ", count: 50).utf8)
+  request.maxBodyCharacters = 50
+  let short = try service.handle(request)
+  expect(short.details?["truncated"] == "true", "Truncation concealed")
+  mail.attachmentName = "broken.pdf"
+  mail.attachmentData = Data("Not a PDF".utf8)
+  mustFail { _ = try service.handle(request) }
+  expect(!FileManager.default.fileExists(atPath: URL(fileURLWithPath: mail.exportedPath!).deletingLastPathComponent().path), "Failed conversion left attachment")
+  expect(try! store.expiredExports(before: Date.distantFuture).isEmpty, "Conversion left cleanup tokens")
+}
+
+try scenario("stale-attachment-cleanup-boundary") { store, _, _ in
+  let root = temp.appendingPathComponent("owned-exports")
+  let old = root.appendingPathComponent(UUID().uuidString)
+  let fresh = root.appendingPathComponent(UUID().uuidString)
+  let unrelated = root.appendingPathComponent("keep-user-folder")
+  let outside = temp.appendingPathComponent("outside")
+  for dir in [old, fresh, unrelated, outside] { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+  let token = try store.registerExport(path: old.path)
+  var db: OpaquePointer?
+  let dbPath = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MAIL_TRIAGE_STATE_DIR"]!).appendingPathComponent("state.sqlite").path
+  expect(sqlite3_open(dbPath, &db) == SQLITE_OK, "Open temporary fixture DB")
+  expect(sqlite3_exec(db, "UPDATE temp_exports SET created_at='2000-01-01T00:00:00Z';", nil, nil, nil) == SQLITE_OK, "Age fixture token")
+  sqlite3_close(db)
+  let link = root.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+  mustFail { try TemporaryAttachments.remove(outside.path, root: root) }
+  mustFail { try TemporaryAttachments.remove(link.path, root: root) }
+  try TemporaryAttachments.sweep(store: store, root: root)
+  expect(!FileManager.default.fileExists(atPath: old.path), "Stale export remained")
+  mustFail { _ = try store.exportPath(token: token) }
+  for dir in [fresh, unrelated, outside] { expect(FileManager.default.fileExists(atPath: dir.path), "Cleanup removed fresh/unrelated data") }
+  let orphan = root.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
+  try FileManager.default.setAttributes([.creationDate: Date(timeIntervalSince1970: 1000)], ofItemAtPath: orphan.path)
+  try TemporaryAttachments.sweep(store: store, root: root)
+  expect(!FileManager.default.fileExists(atPath: orphan.path), "Abandoned unregistered directory remained")
+}
+
+try scenario("oversize-body-isolated") { store, mail, service in
+  mail.rows = [row(1), row(2)]
+  mail.bodies[1] = String(repeating: "x", count: 40 * 1024 * 1024 + 1)
+  let result = try service.handle(scan())
+  expect(result.messages?.count == 2 && result.status == "partial", "Oversize mail blocked healthy mail")
+  expect(result.messages?[0].bodyReadError == "source_size_limit", "Oversize mail lost its diagnostic")
+  expect(result.messages?[1].sanitizedText?.contains("Please submit") == true, "Mail after oversize body was not read")
+  expect(try! store.summary().processedCount == 0, "Scan incorrectly marked mail processed")
+}
+
+try scenario("deadline-diagnostics-preserve-operation") { store, mail, service in
+  mail.rows = [row(1)]
+  mail.expireAfterMetadata = true
+  do {
+    _ = try service.handle(scan())
+    fatalError("Expected deadline failure")
+  } catch let error as MailBridgeError {
+    expect(error.code == "mail_automation_failure", "Changed operational failure code")
+    expect(error.diagnostics?["reason"] == "scan_deadline", "Lost deadline reason")
+    expect(error.diagnostics?["operation"] == "metadata", "Lost failing stage")
+  }
+}
+print("Mail scan/cache: \(checkCount) synthetic scenarios passed; no Apple Mail access")

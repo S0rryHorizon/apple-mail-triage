@@ -29,7 +29,7 @@ final class MailAutomation {
         end repeat
         return output
       end tell
-      """)
+      """, operation: "accounts")
     guard descriptor.descriptorType == typeAEList else {
       throw MailBridgeError.mailAutomation("账户列表不完整；无法确认扫描范围。")
     }
@@ -78,7 +78,7 @@ final class MailAutomation {
         end repeat
         return output
       end tell
-      """)
+      """, operation: "metadata")
     guard descriptor.descriptorType == typeAEList else {
       throw MailBridgeError.mailAutomation("邮件列表不完整；本次扫描未完成，不能推进游标。")
     }
@@ -125,17 +125,33 @@ final class MailAutomation {
 
   func preview(ref: MessageRef, maxCharacters: Int) throws -> String {
     guard maxCharacters > 0 else { return "" }
-    let descriptor = try run(findMessageScript(ref: ref, body: "return content of targetMessage as text"))
-    guard let text = descriptor.stringValue else {
-      throw MailBridgeError.mailAutomation("邮件正文未能读取；本次扫描未完成，不能推进游标。")
+    // Prefer MIME source. Mail sometimes returns a header-only multipart source
+    // even though its rendered body is available; only that case gets a fallback.
+    let descriptor = try run(findMessageScript(ref: ref, body: "return source of targetMessage as text"), operation: "source")
+    guard let raw = descriptor.stringValue else {
+      throw MailBridgeError.mailAutomation("原始邮件未能读取，不能推进游标。")
     }
-    return PrivacyFilter.sanitize(text, limit: maxCharacters)
+    let decoded: String
+    do {
+      decoded = try SourceBody.decode(raw)
+    } catch MailBridgeError.bodyUnavailable("source_body_missing") {
+      let content = try run(findMessageScript(ref: ref, body: "return content of targetMessage as text"), operation: "rendered_body")
+      guard let text = content.stringValue, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw MailBridgeError.bodyUnavailable("source_body_missing")
+      }
+      guard text.utf8.count <= 10 * 1024 * 1024 else {
+        throw MailBridgeError.bodyUnavailable("mail_body_size_limit")
+      }
+      decoded = text
+    }
+    try checkReadDeadline()
+    return PrivacyFilter.sanitize(decoded, limit: maxCharacters)
   }
 
   func read(ref: MessageRef, maxCharacters: Int) throws -> MailMessage {
+    let text = try preview(ref: ref, maxCharacters: maxCharacters)
     let descriptor = try run(findMessageScript(ref: ref, body: """
       set bodyText to ""
-      \(maxCharacters > 0 ? "set bodyText to content of targetMessage as text" : "")
       set attachmentOutput to {}
       try
         repeat with att in mail attachments of targetMessage
@@ -169,7 +185,7 @@ final class MailAutomation {
         set rfcId to message id of targetMessage as text
       end try
       return {(id of acctRef as text), (name of acctRef as text), (name of boxRef as text), (id of targetMessage as integer), rfcId, (date received of targetMessage), (sender of targetMessage as text), (subject of targetMessage as text), (read status of targetMessage as boolean), attachmentOutput, bodyText}
-      """))
+      """), operation: "message_metadata")
     let accountId = descriptor.string(at: 1)
     let libraryId = descriptor.int64(at: 4)
     guard !accountId.isEmpty, libraryId > 0, let receivedDate = descriptor.at(6).dateValue else {
@@ -179,7 +195,6 @@ final class MailAutomation {
     let receivedAt = DateCodec.string(receivedDate)
     let sender = PrivacyFilter.sanitize(descriptor.string(at: 7), limit: 500)
     let subject = PrivacyFilter.sanitize(descriptor.string(at: 8), limit: 1_000)
-    let text = PrivacyFilter.sanitize(descriptor.string(at: 11), limit: maxCharacters)
     let attachments = descriptor.at(10).listItems.map { item in
       AttachmentInfo(
         id: item.string(at: 1),
@@ -222,7 +237,7 @@ final class MailAutomation {
       set targetAttachment to item 1 of matchingAttachments
       save targetAttachment in POSIX file \(pathLiteral)
       return \(pathLiteral)
-      """))
+      """), operation: "attachment_export")
   }
 
   private func findMessageScript(ref: MessageRef, body: String) -> String {
@@ -246,29 +261,34 @@ final class MailAutomation {
       """
   }
 
-  private func run(_ source: String) throws -> NSAppleEventDescriptor {
+  private func run(_ source: String, operation: String) throws -> NSAppleEventDescriptor {
+    let started = now()
     let remaining = readDeadline?.timeIntervalSince(now()) ?? 30
     guard remaining > 0 else {
-      throw MailBridgeError.mailAutomation("扫描超过 60 秒；本次未完成，不能推进游标。请减小 limit 后重新处理完整窗口。")
+      throw MailBridgeError.diagnosedAutomation("扫描超过 60 秒；本次未完成，不能推进游标。", ["reason": "scan_deadline", "operation": operation])
     }
     let deadlineScript = readDeadline.map { dateScript($0, name: "bridgeDeadline", rounding: .down) } ?? ""
     let boundedSource = "\(deadlineScript)\nwith timeout of \(min(30, Int(ceil(remaining)))) seconds\n\(source)\nend timeout"
     if let executor {
       let result = try executor(boundedSource)
-      try checkReadDeadline()
+      try checkReadDeadline(operation: operation)
       return result
     }
     guard let script = NSAppleScript(source: boundedSource) else {
-      throw MailBridgeError.mailAutomation("无法编译 Apple“邮件”脚本。")
+      throw MailBridgeError.diagnosedAutomation("无法编译 Apple“邮件”脚本。", ["reason": "script_compile", "operation": operation])
     }
     var error: NSDictionary?
     let result = script.executeAndReturnError(&error)
     if let error {
       let message = (error[NSAppleScript.errorMessage] as? String) ?? error.description
+      let number = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+      var details = ["operation": operation, "apple_error_number": String(number),
+                     "elapsed_ms": String(max(0, Int(now().timeIntervalSince(started) * 1000)))]
       if message.contains("scan_timeout") || (error[NSAppleScript.errorNumber] as? Int) == -1712 {
-        throw MailBridgeError.mailAutomation("Apple“邮件”操作超时；结果未确认，不得自动重试写入或推进游标。")
+        details["reason"] = number == -1712 ? "apple_event_timeout" : "scan_deadline"
+        throw MailBridgeError.diagnosedAutomation("Apple“邮件”请求超时；本次调用失败，扫描不完整，不能推进游标。", details)
       }
-      if message.contains("Not authorized") || message.contains("不允许") || message.contains("-1743") {
+      if number == -1743 || message.contains("Not authorized") || message.contains("不允许") || message.contains("-1743") {
         throw MailBridgeError.permissionDenied("MailBridge 没有控制 Apple“邮件”的权限：\(message)")
       }
       if message.contains("message_not_found") {
@@ -277,15 +297,16 @@ final class MailAutomation {
       if message.contains("attachment_not_found") {
         throw MailBridgeError.notFound("找不到指定附件。")
       }
-      throw MailBridgeError.mailAutomation("Apple“邮件”脚本失败：\(message)")
+      details["reason"] = "apple_script_error"
+      throw MailBridgeError.diagnosedAutomation("Apple“邮件”脚本失败。", details)
     }
-    try checkReadDeadline()
+    try checkReadDeadline(operation: operation)
     return result
   }
 
-  private func checkReadDeadline() throws {
+  private func checkReadDeadline(operation: String = "source_decode") throws {
     if let readDeadline, now() >= readDeadline {
-      throw MailBridgeError.mailAutomation("扫描超过 60 秒；本次未完成，不能推进游标。请减小 limit 后重新处理完整窗口。")
+      throw MailBridgeError.diagnosedAutomation("扫描超过 60 秒；本次未完成，不能推进游标。", ["reason": "scan_deadline", "operation": operation])
     }
   }
 

@@ -15,7 +15,7 @@ private func inputData() throws -> Data {
         echo '{"action":"status"}' | MailBridge
         MailBridge --request request.json
 
-      Read: setup, status, message.scan, message.read, attachment.export/cleanup
+      Read: setup, status, message.scan, message.read, attachment.text/export/cleanup
       State: state.status, state.record, state.repair, state.pending, candidate.resolve, rule.list/upsert
       """
     FileHandle.standardOutput.write(Data(help.utf8))
@@ -42,6 +42,9 @@ do {
   let service = try MailBridgeService()
   emit(try service.handle(request))
 } catch {
-  emit(BridgeResponse(ok: false, status: "error", message: String(describing: error)))
+  var response = BridgeResponse(ok: false, status: "error", message: String(describing: error))
+  response.errorCode = (error as? MailBridgeError)?.code ?? (error is DecodingError ? "request_validation" : "unexpected_bridge_error")
+  response.details = (error as? MailBridgeError)?.diagnostics
+  emit(response)
   exit(1)
 }

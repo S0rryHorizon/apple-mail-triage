@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -19,11 +20,13 @@ def setUpModule():
 class ScanTests(unittest.TestCase):
     def test_scan_regressions(self):
         with tempfile.TemporaryDirectory() as temp:
+            fixtures = pathlib.Path(temp) / "attachments"
+            fixtures.mkdir()
+            self.make_attachments(fixtures)
             main = pathlib.Path(temp) / "main.swift"
             shutil.copyfile(ROOT / "Tests/ScanRegression.swift", main)
             binary = pathlib.Path(temp) / "ScanTests"
-            sources = [ROOT / "Sources/MailBridgeRuntime" / name for name in
-                       ["StateStore.swift", "MailAutomation.swift", "MailBridgeService.swift"]]
+            sources = sorted((ROOT / "Sources/MailBridgeRuntime").glob("*.swift"))
             core = pathlib.Path(temp) / "MailBridgeCore.o"
             core_command = ["swiftc", "-parse-as-library", "-emit-module", "-emit-object",
                             "-whole-module-optimization", "-module-name", "MailBridgeCore",
@@ -34,9 +37,51 @@ class ScanTests(unittest.TestCase):
             command = ["swiftc", "-package-name", "MailBridge", "-I", temp, *map(str, sources), str(main), str(core), "-lsqlite3", "-o", str(binary)]
             compiled = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120,
+                                    env=dict(os.environ, MAIL_TRIAGE_TEST_FIXTURES=str(fixtures)))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             print(result.stdout.strip())
+
+    @staticmethod
+    def make_attachments(directory):
+        # Minimal real document formats; synthetic content only, no live mailbox fixtures.
+        def package(name, files):
+            with zipfile.ZipFile(directory / name, "w", zipfile.ZIP_DEFLATED) as archive:
+                for path, value in files.items():
+                    archive.writestr(path, value)
+        relationships = 'http://schemas.openxmlformats.org/package/2006/relationships'
+        office = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+        def rel(kind, target):
+            return f'<Relationships xmlns="{relationships}"><Relationship Id="rId1" Type="{office}/{kind}" Target="{target}"/></Relationships>'
+        def content_type(part, value):
+            return ('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    '<Default Extension="xml" ContentType="application/xml"/>'
+                    f'<Override PartName="/{part}" ContentType="{value}"/></Types>')
+        package("synthetic.docx", {
+            "[Content_Types].xml": content_type("word/document.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"),
+            "_rels/.rels": rel("officeDocument", "word/document.xml"),
+            "word/document.xml": '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Synthetic Word content</w:t></w:r></w:p></w:body></w:document>'})
+        sheet_ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+        package("synthetic.xlsx", {
+            "[Content_Types].xml": content_type("xl/workbook.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"),
+            "_rels/.rels": rel("officeDocument", "xl/workbook.xml"),
+            "xl/_rels/workbook.xml.rels": rel("worksheet", "worksheets/sheet1.xml"),
+            "xl/workbook.xml": f'<workbook xmlns="{sheet_ns}" xmlns:r="{office}"><sheets><sheet name="Synthetic" sheetId="1" r:id="rId1"/></sheets></workbook>',
+            "xl/worksheets/sheet1.xml": f'<worksheet xmlns="{sheet_ns}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Synthetic Excel content</t></is></c></row><row r="2"><c r="A2"><v>42</v></c></row></sheetData></worksheet>'})
+        stream = b'BT /F1 12 Tf 72 720 Td (Synthetic PDF content) Tj ET'
+        objects = [b'<< /Type /Catalog /Pages 2 0 R >>', b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+                   b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+                   b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+                   b'<< /Length %d >>\nstream\n' % len(stream) + stream + b'\nendstream']
+        pdf, offsets = b'%PDF-1.4\n', [0]
+        for number, obj in enumerate(objects, 1):
+            offsets.append(len(pdf))
+            pdf += str(number).encode() + b' 0 obj\n' + obj + b'\nendobj\n'
+        xref = len(pdf)
+        pdf += b'xref\n0 6\n0000000000 65535 f \n' + b''.join(b'%010d 00000 n \n' % offset for offset in offsets[1:])
+        pdf += b'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % xref
+        (directory / "synthetic.pdf").write_bytes(pdf)
 
 
 class LockTests(unittest.TestCase):
@@ -96,6 +141,14 @@ class LockTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertLess(time.monotonic() - started, 2)
         self.db.rollback()
+
+    def test_error_codes_distinguish_validation_from_operational_failure(self):
+        code, response = self.call({"action": "attachment.export"})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(response["errorCode"], "request_validation")
+        code, response = self.call({"action": "candidate.resolve"})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(response["errorCode"], "confirmation_required")
 
     def test_retired_flag_state_is_unused_and_preserved(self):
         tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}

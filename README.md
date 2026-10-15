@@ -6,7 +6,7 @@ A local macOS bridge and Codex skill for Apple Mail summaries, action items and 
 
 ## Install
 
-Requires macOS 14+, enabled Apple Mail accounts, Swift 6 command-line tools and Codex desktop.
+Requires macOS 14+, enabled Apple Mail accounts, Swift 6 command-line tools, `/usr/bin/python3` (provided by the command-line tools) and Codex desktop. Body decoding uses Python's standard `email` parser; no additional Python packages are required.
 
 ```sh
 ./scripts/install.sh
@@ -15,9 +15,11 @@ printf '%s' '{"action":"setup"}' | "$HOME/Applications/MailBridge.app/Contents/M
 
 The installer copies the bridge to `~/Applications/MailBridge.app` and the skill to `${CODEX_HOME:-$HOME/.codex}/skills/email-triage`. Initial setup may open the macOS Automation permission prompt. `MAILBRIDGE_PATH` and `CALENDAR_BRIDGE_PATH` support custom bridge locations.
 
+For self-cleaning attachment text extraction, optionally run `zsh scripts/install-converter.sh` (requires `uv`). It installs pinned MarkItDown with PDF/DOCX/XLSX dependencies into `~/Library/Application Support/MailTriage/converter`; these reusable program dependencies stay installed, while each `attachment.text` export is removed before returning text or a conversion error. No converted Markdown files are stored. Text remains in the calling conversation. Images/scanned pages may require separate visual inspection. On subsequent bridge invocations, abandoned exports older than 24 hours are removed only from the bridge's own temporary directory.
+
 ## Triage and candidates
 
-Ask Codex: “使用 $email-triage 整理邮件。” Manual use follows the current task's model. The first scan covers 24 hours; later runs resume with a 15-minute overlap and fingerprint deduplication. A scan returns rules and state together. It freezes its time window and finishes pagination before saving progress. Failed/partial scans never advance cursors.
+Ask Codex: “使用 $email-triage 整理邮件。” Manual use follows the current task's model. The first scan covers 24 hours; later runs resume with a 15-minute overlap and fingerprint deduplication. A scan returns rules and state together. It freezes its time window and finishes pagination before saving progress. Operationally failed/incomplete pages cannot advance cursors. Individual MIME decoding failures are returned as unread items; successful mail can be saved, but affected cursors cannot skip the unread mail, and the run is reported as partial.
 
 Read relevant bodies and approved attachments before reporting. Useful notices are summarized even without an action. Reports stay in the Codex task. A successful run with nothing worth reporting replies:
 
@@ -28,6 +30,10 @@ Confirm a candidate naturally in the same task: “把实验报告截止日加�
 See the [skill](skill/email-triage/SKILL.md) and [JSON interface](skill/email-triage/references/interface.md).
 
 ## Scheduled workflow
+
+Automatic repair is reserved for operational failures. Chat-archive cleanup is deferred without starting a repair task; unreadable bodies, attachment limits, request validation and user-permission issues stay in the existing workflow. MailBridge supplies stable error codes, and the runtime enforces the exclusions at incident creation and automatic launch. Genuine unresolved operational incidents still allow one repair task and one recovery run; repeated encounters cannot spawn another repairer.
+
+Background requests go through runtime `bridge.call`, which executes MailBridge once, parses error JSON on any exit code, and persists the run outcome before returning. It enforces frozen pagination before saving and derives recorded/partial status from the successful save receipt. Unknown responses stop without replay; a handled failure returns a complete envelope and its registered recovery decision. Raw mail and command output are not stored in the runtime journal.
 
 The saved local mailbox project runs at 08:00 and 20:00 Asia/Singapore. The [dispatcher](automation/weekly-dispatcher.md) maintains one task per ISO week, keeps this and last week visible, and archives older managed tasks. New weekly and repair tasks fork a fixed blank template with the mailbox execution permissions. The template stays archived between uses. Ordinary scheduled creation was observed to fall back to workspace-write/on-request despite the project config; a manual creation probe did not cover that path.
 
@@ -43,7 +49,7 @@ The saved local mailbox project runs at 08:00 and 20:00 Asia/Singapore. The [dis
 
 The helper stores slot reservations, managed task IDs and repair incidents under the existing private automation directory. It replaces repeated task discovery and title checks. Before enabling this workflow, initialize the existing weekly registry using `{"action":"initialize"}`. New installations need a schemaVersion 1 registry with automationId, saved projectId, local hostId, templateThreadId and managedThreads; do not adopt arbitrary similarly named tasks.
 
-Returned technical failures launch one independent repair task per unresolved incident. The [repairer](automation/repair.md) may fix project code/config and reinstall the bridge after backup. It can retry triage once. Old failure tasks are archived only after saved state and a real report are confirmed. A second failure stays visible. Global settings, system permissions and account login require the user. Unknown/no-result calls are not replayed; there is no independent watchdog.
+Returned technical failures launch one independent repair task per unresolved incident. Archive incidents track the actual target across runs and error labels; unresolved targets stay blocked instead of being retried by every dispatcher. The [repairer](automation/repair.md) may fix project code/config and reinstall the bridge after backup. It can retry triage once, but never rescans for an archive failure. Archive recovery requires that the original target was archived or its local reference was verified missing; a missing reference is recorded separately from a successful archive. Old failure tasks are archived only after saved state and a real report are confirmed. A second failure stays visible. Global settings, system permissions and account login require the user. Unknown/no-result calls are not replayed; there is no independent watchdog.
 
 Schedules require an awake Mac, available Codex desktop and this project path. Paused automation is never resumed automatically. Planned slots determine the reporting week, including delayed execution.
 

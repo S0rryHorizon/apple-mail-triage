@@ -11,6 +11,7 @@ public final class MailBridgeService {
     let mail = MailAutomation()
     automation = mail
     store = try StateStore()
+    try TemporaryAttachments.sweep(store: store)
     accountProvider = { try mail.accounts() }
     scanProvider = { since, until, offset, limit, _ in
       try mail.scanMetadata(since: since, until: until, offset: offset, limit: limit)
@@ -47,6 +48,7 @@ public final class MailBridgeService {
     case "message.scan": return try automation.withReadDeadline { try scan(request) }
     case "message.read": return try read(request)
     case "attachment.export": return try exportAttachment(request)
+    case "attachment.text": return try attachmentText(request)
     case "attachment.cleanup": return try cleanupAttachment(request)
     case "state.status": return try stateStatus(request)
     case "state.record": return try recordState(request)
@@ -121,20 +123,28 @@ public final class MailBridgeService {
         seenFingerprints.insert(message.fingerprint).inserted,
         try !store.isProcessed(message.ref, fingerprint: message.fingerprint)
       {
-        let text = try automation.preview(ref: message.ref, maxCharacters: preview)
-        message.sanitizedText = text
-        message.hint = TriageRules.hint(sender: message.sender, subject: message.subject, text: text)
+        do {
+          let text = try automation.preview(ref: message.ref, maxCharacters: preview)
+          message.sanitizedText = text
+          message.hint = TriageRules.hint(sender: message.sender, subject: message.subject, text: text)
+          if preview > 0 { try store.clearBodyFailure(message.ref) }
+          else if try store.hasBodyFailure(message.ref) { message.bodyReadError = "body_not_read" }
+        } catch MailBridgeError.bodyUnavailable(let reason) {
+          message.bodyReadError = reason
+          try store.bodyFailure(message, reason: reason)
+        }
         messages.append(message)
       }
     }
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
+    if messages.contains(where: { $0.bodyReadError != nil }) { response.status = "partial" }
     response.messages = messages.sorted {
       if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
       if $0.ref.accountId != $1.ref.accountId { return $0.ref.accountId < $1.ref.accountId }
       return $0.ref.libraryId < $1.ref.libraryId
     }
     response.rules = try store.rules()
-    response.state = state
+    response.state = try store.summary()
     response.details = [
       "since": DateCodec.string(since),
       "until": DateCodec.string(until),
@@ -144,6 +154,7 @@ public final class MailBridgeService {
       "scannedCount": String(page.count),
       "newCount": String(messages.count),
       "overlapMinutes": "15",
+      "bodyFailureCount": String(messages.filter { $0.bodyReadError != nil }.count),
     ]
     return response
   }
@@ -151,8 +162,20 @@ public final class MailBridgeService {
   private func read(_ request: BridgeRequest) throws -> BridgeResponse {
     guard let ref = request.ref else { throw MailBridgeError.invalidRequest("message.read 缺少 ref。") }
     let limit = min(max(request.maxBodyCharacters ?? 8_000, 0), 40_000)
-    let message = try automation.read(ref: ref, maxCharacters: limit)
+    var message: MailMessage
+    do {
+      message = try automation.read(ref: ref, maxCharacters: limit)
+      if limit > 0 { try store.clearBodyFailure(ref) }
+      else if try store.hasBodyFailure(ref) { message.bodyReadError = "body_not_read" }
+    } catch MailBridgeError.bodyUnavailable(let reason) {
+      message = try automation.read(ref: ref, maxCharacters: 0)
+      message.bodyReadError = reason
+      if try !store.isProcessed(ref, fingerprint: message.fingerprint) {
+        try store.bodyFailure(message, reason: reason)
+      }
+    }
     var response = BridgeResponse(ok: true, status: "ok", requestId: request.requestId)
+    if message.bodyReadError != nil { response.status = "partial" }
     response.messages = [message]
     return response
   }
@@ -176,16 +199,21 @@ public final class MailBridgeService {
     case .rejected(let reason):
       throw MailBridgeError.attachmentRejected("\(reason.rawValue): \(reason.message)")
     }
-    let base = FileManager.default.temporaryDirectory
-      .appendingPathComponent("MailTriage", isDirectory: true)
+    let base = TemporaryAttachments.root
       .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
     try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     let fileName = sanitizedFileName(attachment.name)
     let output = base.appendingPathComponent(fileName)
     let token: String
     do {
-      try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
       token = try store.registerExport(path: base.path)
+      do {
+        try automation.exportAttachment(ref: ref, attachmentId: attachmentId, destination: output.path)
+      } catch {
+        try TemporaryAttachments.remove(base.path)
+        try store.removeExport(token: token)
+        throw error
+      }
     } catch {
       try? FileManager.default.removeItem(at: base)
       throw error
@@ -207,16 +235,27 @@ public final class MailBridgeService {
       throw MailBridgeError.invalidRequest("attachment.cleanup 缺少 cleanupToken。")
     }
     let path = try store.exportPath(token: token)
-    let expected = FileManager.default.temporaryDirectory.appendingPathComponent("MailTriage").standardizedFileURL.path
-    let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
-    guard resolved.hasPrefix(expected + "/") else {
-      throw MailBridgeError.attachmentRejected("拒绝清理 MailTriage 临时目录以外的路径。")
-    }
-    if FileManager.default.fileExists(atPath: resolved) {
-      try FileManager.default.removeItem(atPath: resolved)
-    }
+    try TemporaryAttachments.remove(path)
     try store.removeExport(token: token)
     return BridgeResponse(ok: true, status: "cleaned", requestId: request.requestId)
+  }
+
+  private func attachmentText(_ request: BridgeRequest) throws -> BridgeResponse {
+    let exported = try exportAttachment(request).attachment!
+    let conversion: Result<(String, Bool), Error>
+    do {
+      conversion = .success(try AttachmentText.extract(path: exported.path, limit: min(max(request.maxBodyCharacters ?? 16000, 1), 40000)))
+    } catch { conversion = .failure(error) }
+    // Clean before returning either text or the conversion error. No Markdown files.
+    var cleanup = BridgeRequest(action: "attachment.cleanup")
+    cleanup.cleanupToken = exported.cleanupToken
+    _ = try cleanupAttachment(cleanup)
+    let (text, truncated) = try conversion.get()
+    var response = BridgeResponse(ok: true, status: "extracted", requestId: request.requestId)
+    response.text = text
+    response.details = ["cleanup": "cleaned", "truncated": String(truncated),
+                        "contentScope": "text_only", "imagesAndLayoutVerified": "false"]
+    return response
   }
 
   private func stateStatus(_ request: BridgeRequest) throws -> BridgeResponse {

@@ -4,6 +4,8 @@ public enum MailBridgeError: Error, CustomStringConvertible {
   case invalidRequest(String)
   case permissionDenied(String)
   case mailAutomation(String)
+  case diagnosedAutomation(String, [String: String])
+  case bodyUnavailable(String)
   case notFound(String)
   case confirmationRequired(String)
   case attachmentRejected(String)
@@ -11,10 +13,29 @@ public enum MailBridgeError: Error, CustomStringConvertible {
 
   public var description: String {
     switch self {
+    case .diagnosedAutomation(let message, _): return message
     case .invalidRequest(let message), .permissionDenied(let message),
-      .mailAutomation(let message), .notFound(let message),
+      .mailAutomation(let message), .bodyUnavailable(let message), .notFound(let message),
       .confirmationRequired(let message), .attachmentRejected(let message),
       .storage(let message): return message
+    }
+  }
+
+  public var diagnostics: [String: String]? {
+    if case .diagnosedAutomation(_, let details) = self { return details }
+    return nil
+  }
+
+  public var code: String {
+    switch self {
+    case .invalidRequest: return "request_validation"
+    case .permissionDenied: return "permission_required"
+    case .mailAutomation, .diagnosedAutomation: return "mail_automation_failure"
+    case .bodyUnavailable(let reason): return reason
+    case .notFound: return "not_found"
+    case .confirmationRequired: return "confirmation_required"
+    case .attachmentRejected: return "attachment_limitation"
+    case .storage: return "state_storage_failure"
     }
   }
 }
@@ -89,6 +110,7 @@ public struct MailMessage: Codable, Equatable, Sendable {
   public var sender: String
   public var subject: String
   public var sanitizedText: String?
+  public var bodyReadError: String?
   public var isRead: Bool
   public var attachmentCount: Int
   public var attachments: [AttachmentInfo]?
@@ -239,6 +261,7 @@ public struct StateSummary: Codable, Equatable, Sendable {
   public var processedCount: Int
   public var pendingCandidateCount: Int
   public var cursors: [CursorRecord]
+  public var deferredBodyCount: Int = 0
 
   public init(
     processedCount: Int,
@@ -279,7 +302,9 @@ public struct BridgeResponse: Codable, Sendable {
   public var rules: [ExplicitRule]?
   public var state: StateSummary?
   public var attachment: ExportedAttachment?
+  public var text: String?
   public var errors: [String]?
+  public var errorCode: String?
 
   public init(
     ok: Bool,
