@@ -129,6 +129,12 @@ package final class StateStore {
         throw MailBridgeError.invalidRequest("游标必须是 ISO 8601 时间。")
       }
     }
+    let windowUntil = try update.windowUntil.map { value -> Date in
+      guard let date = DateCodec.date(value), date <= Date().addingTimeInterval(60) else {
+        throw MailBridgeError.invalidRequest("windowUntil 必须是不晚于当前时间的 ISO 8601 时间。")
+      }
+      return date
+    }
     try transaction {
       let now = DateCodec.string(Date())
       for record in update.processed ?? [] {
@@ -160,30 +166,40 @@ package final class StateStore {
       }
       for candidate in update.candidates ?? [] { try upsertCandidate(candidate, now: now) }
       for cursor in update.cursors ?? [] {
-        // A later successful message must never move the cursor past unread mail.
-        let blockedAt = try withStatement("SELECT MIN(julianday(received_at)) FROM body_failures WHERE account_id = ?;") { statement -> Date? in
-          bind(cursor.accountId, 1, statement)
-          guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
-          return Date(timeIntervalSince1970: (sqlite3_column_double(statement, 0) - 2440587.5) * 86400 - 1)
-        }
-        let effective = blockedAt.map { min(DateCodec.date(cursor.receivedAt)!, $0) } ?? DateCodec.date(cursor.receivedAt)!
-        try withStatement(
-          """
-          INSERT INTO cursors(account_id, received_at, updated_at) VALUES(?, ?, ?)
-          ON CONFLICT(account_id) DO UPDATE SET
-            received_at = CASE
-              WHEN julianday(excluded.received_at) > julianday(cursors.received_at) THEN excluded.received_at
-              ELSE cursors.received_at
-            END,
-            updated_at=excluded.updated_at;
-          """
-        ) { statement in
-          bind(cursor.accountId, 1, statement)
-          bind(DateCodec.string(effective), 2, statement)
-          bind(now, 3, statement)
-          try stepDone(statement)
-        }
+        try advanceCursor(cursor.accountId, to: DateCodec.date(cursor.receivedAt)!, now: now)
       }
+      if let windowUntil {
+        // A fully scanned window has no unseen mail for any enabled account, so
+        // accounts without new mail must not keep anchoring later windows.
+        let tracked = try summary().cursors.map(\.accountId).filter(enabledAccountIds.contains)
+        for accountId in tracked { try advanceCursor(accountId, to: windowUntil, now: now) }
+      }
+    }
+  }
+
+  private func advanceCursor(_ accountId: String, to target: Date, now: String) throws {
+    // A later successful message must never move the cursor past unread mail.
+    let blockedAt = try withStatement("SELECT MIN(julianday(received_at)) FROM body_failures WHERE account_id = ?;") { statement -> Date? in
+      bind(accountId, 1, statement)
+      guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+      return Date(timeIntervalSince1970: (sqlite3_column_double(statement, 0) - 2440587.5) * 86400 - 1)
+    }
+    let effective = blockedAt.map { min(target, $0) } ?? target
+    try withStatement(
+      """
+      INSERT INTO cursors(account_id, received_at, updated_at) VALUES(?, ?, ?)
+      ON CONFLICT(account_id) DO UPDATE SET
+        received_at = CASE
+          WHEN julianday(excluded.received_at) > julianday(cursors.received_at) THEN excluded.received_at
+          ELSE cursors.received_at
+        END,
+        updated_at=excluded.updated_at;
+      """
+    ) { statement in
+      bind(accountId, 1, statement)
+      bind(DateCodec.string(effective), 2, statement)
+      bind(now, 3, statement)
+      try stepDone(statement)
     }
   }
 

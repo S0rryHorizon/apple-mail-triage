@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -26,8 +27,11 @@ NON_REPAIR_CODES = {
     "request_validation", "permission_required", "permission_denied", "confirmation_required",
     "not_found", "attachment_limitation", "attachment_rejected", "attachment_policy_rejected",
     "attachment_conversion_failed", "source_size_limit", "mail_body_size_limit",
-    "body_decode_failed", "body_not_read", "source_body_missing",
+    "body_decode_failed", "body_not_read", "source_body_missing", "body_timeout", "mail_timeout",
 }
+TIMEOUT_REASONS = {"apple_event_timeout", "scan_deadline"}
+TIMEOUT_RETRY_ACTIONS = {"message.scan", "message.read"}
+TIMEOUT_RETRY_PAUSE = 10
 BRIDGE_ACTIONS = {"message.scan", "message.read", "attachment.text", "attachment.export",
                   "attachment.cleanup", "state.status", "state.pending", "rule.list", "state.record"}
 
@@ -75,6 +79,8 @@ def cleanup_incident(incident):
 def repair_exclusion(incident):
     if cleanup_incident(incident):
         return "cleanup_deferred"
+    if incident.get("error_code") == "mail_timeout":
+        return "transient_mail_timeout"
     if incident.get("error_code") in NON_REPAIR_CODES or incident.get("stage", "").startswith("attachment."):
         return "content_validation_or_user_action"
     return None
@@ -229,22 +235,44 @@ class Runtime:
                         payload[key] = value
                 elif payload.get("offset", 0) != 0:
                     raise ValueError("首个扫描页必须从 offset 0 开始")
-            if action == "state.record" and not (scan and scan["complete"]):
-                raise ValueError("冻结窗口尚未扫描完毕，不能保存整理结果")
+            if action == "state.record":
+                if not (scan and scan["complete"]):
+                    raise ValueError("冻结窗口尚未扫描完毕，不能保存整理结果")
+                if isinstance(payload.get("state"), dict):
+                    # Close the whole window so accounts without new mail stop anchoring it.
+                    payload["state"] = {**payload["state"], "windowUntil": scan["until"]}
             executable = os.environ.get("MAILBRIDGE_PATH") or str(Path.home() / "Applications/MailBridge.app/Contents/MacOS/MailBridge")
-            try:
-                process = subprocess.run([executable], input=json.dumps(payload),
-                    capture_output=True, text=True, timeout=90)
-                result = bridge_result(process.returncode, process.stdout)
-                # A broken write response cannot prove whether its transaction committed.
-                if action == "state.record" and result.get("error_code") == "bridge_invalid_response":
-                    result["outcome"] = "unknown"
-            except subprocess.TimeoutExpired:
-                result = {"outcome": "unknown", "error_code": "bridge_timeout"}
-            except OSError:
-                result = {"outcome": "failed", "error_code": "bridge_unavailable"}
-            except UnicodeError:
-                result = {"outcome": "unknown", "error_code": "bridge_invalid_response"}
+
+            def execute():
+                try:
+                    process = subprocess.run([executable], input=json.dumps(payload),
+                        capture_output=True, text=True, timeout=90)
+                    result = bridge_result(process.returncode, process.stdout)
+                    # A broken write response cannot prove whether its transaction committed.
+                    if action == "state.record" and result.get("error_code") == "bridge_invalid_response":
+                        result["outcome"] = "unknown"
+                    return result
+                except subprocess.TimeoutExpired:
+                    return {"outcome": "unknown", "error_code": "bridge_timeout"}
+                except OSError:
+                    return {"outcome": "failed", "error_code": "bridge_unavailable"}
+                except UnicodeError:
+                    return {"outcome": "unknown", "error_code": "bridge_invalid_response"}
+
+            def mail_timed_out(result):
+                return (result["outcome"] == "failed" and result.get("error_code") == "mail_automation_failure"
+                        and result.get("diagnostics", {}).get("reason") in TIMEOUT_REASONS)
+
+            result = execute()
+            if action in TIMEOUT_RETRY_ACTIONS and mail_timed_out(result):
+                # An explicit Apple Mail timeout on a read is a definite failure
+                # with no write, so one paused retry is safe. A repair task cannot
+                # speed up Mail; a repeated stall waits for the next slot instead.
+                time.sleep(TIMEOUT_RETRY_PAUSE)
+                result = execute()
+                result["timeout_retried"] = True
+                if mail_timed_out(result):
+                    result["error_code"] = "mail_timeout"
             if result["outcome"] == "succeeded":
                 response = result["bridge"]
                 if action == "message.scan":
@@ -281,7 +309,7 @@ class Runtime:
                            "blocked" if repair_exclusion({"stage": action, "error_code": result["error_code"]}) else "failed",
                            ended_at=timestamp().isoformat())
             run["last_bridge"] = {"action": action, "at": timestamp().isoformat(),
-                                  **{key: result[key] for key in ("outcome", "error_code", "exit_code", "diagnostics") if key in result}}
+                                  **{key: result[key] for key in ("outcome", "error_code", "exit_code", "diagnostics", "timeout_retried") if key in result}}
             self.save(state)
             result["run_phase"] = run["phase"]
         if result["outcome"] == "failed":

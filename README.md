@@ -31,7 +31,7 @@ See the [skill](skill/email-triage/SKILL.md) and [JSON interface](skill/email-tr
 
 ## Scheduled workflow
 
-Automatic repair is reserved for operational failures. Chat-archive cleanup is deferred without starting a repair task; unreadable bodies, attachment limits, request validation and user-permission issues stay in the existing workflow. MailBridge supplies stable error codes, and the runtime enforces the exclusions at incident creation and automatic launch. Genuine unresolved operational incidents still allow one repair task and one recovery run; repeated encounters cannot spawn another repairer.
+Automatic repair is reserved for operational failures. Chat-archive cleanup is deferred without starting a repair task; unreadable bodies, attachment limits, request validation and user-permission issues stay in the existing workflow. MailBridge supplies stable error codes, and the runtime enforces the exclusions at incident creation and automatic launch. Genuine unresolved operational incidents still allow one repair task and one recovery run; repeated encounters cannot spawn another repairer. An explicit Apple Mail timeout is retried once in place after a short pause; if Mail is still unresponsive the run stops as `mail_timeout` without a repair task, and the next slot rescans the unchanged window. A single slow message body becomes an unread `body_timeout` item instead of failing the scan.
 
 Background requests go through runtime `bridge.call`, which executes MailBridge once, parses error JSON on any exit code, and persists the run outcome before returning. It enforces frozen pagination before saving and derives recorded/partial status from the successful save receipt. Unknown responses stop without replay; a handled failure returns a complete envelope and its registered recovery decision. Raw mail and command output are not stored in the runtime journal.
 
@@ -41,8 +41,8 @@ The saved local mailbox project runs at 08:00 and 20:00 Asia/Singapore. The [dis
 
 | Role | Model | Reasoning |
 | --- | --- | --- |
-| Triage | gpt-6-luna | max |
-| Dispatcher | gpt-6-luna | max |
+| Triage | gpt-5.6-luna | max |
+| Dispatcher | gpt-5.6-luna | max |
 | Repair | gpt-6-astra | medium |
 
 `automation/runtime.py` accepts JSON on stdin. Use `config.get` to inspect or `config.set` with role/model/reasoning_effort to edit. Dispatcher changes additionally require `config.sync` followed by the App automation-update tool, preserving schedule, status and notifications. The skill itself cannot switch the model of an existing manual conversation.

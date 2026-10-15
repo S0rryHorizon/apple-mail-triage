@@ -118,12 +118,16 @@ public final class MailBridgeService {
     let page = Array(scanned.prefix(limit))
     var messages: [MailMessage] = []
     var seenFingerprints = Set<String>()
+    var bodyStalled = false
     for var message in page {
       if enabledAccountIds.contains(message.ref.accountId),
         seenFingerprints.insert(message.fingerprint).inserted,
         try !store.isProcessed(message.ref, fingerprint: message.fingerprint)
       {
         do {
+          // After one body timeout, defer the remaining bodies instead of
+          // spending the rest of the scan budget on a stalled Mail.
+          if bodyStalled && preview > 0 { throw MailBridgeError.bodyUnavailable("body_timeout") }
           let text = try automation.preview(ref: message.ref, maxCharacters: preview)
           message.sanitizedText = text
           message.hint = TriageRules.hint(sender: message.sender, subject: message.subject, text: text)
@@ -131,6 +135,7 @@ public final class MailBridgeService {
           else if try store.hasBodyFailure(message.ref) { message.bodyReadError = "body_not_read" }
         } catch MailBridgeError.bodyUnavailable(let reason) {
           message.bodyReadError = reason
+          bodyStalled = bodyStalled || reason == "body_timeout"
           try store.bodyFailure(message, reason: reason)
         }
         messages.append(message)

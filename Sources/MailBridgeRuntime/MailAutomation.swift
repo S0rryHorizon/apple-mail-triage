@@ -125,6 +125,17 @@ final class MailAutomation {
 
   func preview(ref: MessageRef, maxCharacters: Int) throws -> String {
     guard maxCharacters > 0 else { return "" }
+    do {
+      return try sourcePreview(ref: ref, maxCharacters: maxCharacters)
+    } catch MailBridgeError.diagnosedAutomation(_, let details)
+      where ["apple_event_timeout", "scan_deadline"].contains(details["reason"]) {
+      // A slow body (often a large message Mail has not downloaded yet) is an
+      // unread item for the next run, not a failed scan; the cursor stays before it.
+      throw MailBridgeError.bodyUnavailable("body_timeout")
+    }
+  }
+
+  private func sourcePreview(ref: MessageRef, maxCharacters: Int) throws -> String {
     // Prefer MIME source. Mail sometimes returns a header-only multipart source
     // even though its rendered body is available; only that case gets a fallback.
     let descriptor = try run(findMessageScript(ref: ref, body: "return source of targetMessage as text"), operation: "source")

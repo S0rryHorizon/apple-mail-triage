@@ -89,12 +89,12 @@ class RuntimeTests(unittest.TestCase):
         self.start()
         result, _ = self.bridge({"action": "message.scan"}, {
             "ok": False, "errorCode": "mail_automation_failure", "message": "private mail",
-            "details": {"operation": "source", "reason": "apple_event_timeout",
-                        "apple_error_number": "-1712", "elapsed_ms": "30001",
+            "details": {"operation": "metadata", "reason": "apple_script_error",
+                        "apple_error_number": "-1728", "elapsed_ms": "1200",
                         "subject": "private mail"}}, code=1)
         saved = self.runtime.state()["runs"][self.run_id]["last_bridge"]["diagnostics"]
         self.assertEqual(saved, result["diagnostics"])
-        self.assertEqual(saved["apple_error_number"], "-1712")
+        self.assertEqual(saved["apple_error_number"], "-1728")
         incident_id = result["recovery"]["incident"]["id"]
         self.call("repair.prepare", incident_id=incident_id)
         self.call("repair.attach", incident_id=incident_id, thread_id=self.repairer)
@@ -106,6 +106,62 @@ class RuntimeTests(unittest.TestCase):
                 "operation": "private mail", "reason": ["private"],
                 "elapsed_ms": "private", "apple_error_number": {"private": 1}}}))
         self.assertNotIn("diagnostics", malformed)
+
+    def timeout_response(self, reason="apple_event_timeout"):
+        return subprocess.CompletedProcess(["synthetic-bridge"], 1, json.dumps({
+            "ok": False, "errorCode": "mail_automation_failure", "message": "private mail",
+            "details": {"operation": "metadata", "reason": reason, "apple_error_number": "-1712"}}), "")
+
+    def test_mail_timeout_on_read_retries_once_in_place(self):
+        self.start()
+        page = subprocess.CompletedProcess(["synthetic-bridge"], 0, json.dumps({
+            "ok": True, "status": "ok", "messages": [], "details": {
+                "since": "2026-09-24T00:00:00Z", "until": "2026-09-25T00:00:00Z",
+                "hasMore": "false", "nextOffset": "0"}}), "")
+        with patch.object(module.subprocess, "run", side_effect=[self.timeout_response(), page]) as execute, \
+                patch.object(module.time, "sleep") as pause:
+            result = self.call("bridge.call", run_id=self.run_id, thread_id=self.worker, request={"action": "message.scan"})
+        self.assertEqual((result["outcome"], result["run_phase"]), ("succeeded", "running"))
+        self.assertEqual(execute.call_count, 2)
+        pause.assert_called_once()
+        self.assertTrue(self.runtime.state()["runs"][self.run_id]["scan"]["complete"])
+        self.assertEqual(self.runtime.state()["incidents"], {})
+
+    def test_repeated_mail_timeout_waits_for_next_slot_without_repair(self):
+        self.start()
+        with patch.object(module.subprocess, "run", side_effect=[self.timeout_response(), self.timeout_response("scan_deadline")]) as execute, \
+                patch.object(module.time, "sleep"):
+            result = self.call("bridge.call", run_id=self.run_id, thread_id=self.worker, request={"action": "message.scan"})
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual((result["outcome"], result["error_code"], result["run_phase"]), ("failed", "mail_timeout", "blocked"))
+        self.assertEqual(result["recovery"], {"repair": False, "reason": "transient_mail_timeout"})
+        saved = self.runtime.state()["runs"][self.run_id]["last_bridge"]
+        self.assertEqual((saved["error_code"], saved["timeout_retried"], saved["diagnostics"]["reason"]),
+                         ("mail_timeout", True, "scan_deadline"))
+        self.assertEqual(self.runtime.state()["incidents"], {})
+        self.assertNotIn("private", self.runtime.state_path.read_text())
+
+    def test_non_timeout_and_write_failures_are_not_retried(self):
+        for payload in ({"action": "message.scan"}, {"action": "attachment.export"}):
+            with self.subTest(action=payload["action"]):
+                self.setUp()
+                self.start()
+                response = self.timeout_response() if payload["action"] != "message.scan" else \
+                    self.timeout_response("apple_script_error")
+                with patch.object(module.subprocess, "run", return_value=response) as execute, \
+                        patch.object(module.time, "sleep") as pause:
+                    result = self.call("bridge.call", run_id=self.run_id, thread_id=self.worker, request=payload)
+                self.assertEqual(execute.call_count, 1)
+                pause.assert_not_called()
+                self.assertEqual(result["error_code"], "mail_automation_failure")
+
+    def test_state_record_closes_frozen_window(self):
+        self.start()
+        self.bridge_page()
+        _, execute = self.bridge({"action": "state.record", "state": {"processed": [], "windowUntil": "2030-01-01T00:00:00Z"}},
+            {"ok": True, "status": "recorded", "state": {"deferredBodyCount": 0}})
+        sent = json.loads(execute.call_args.kwargs["input"])
+        self.assertEqual(sent["state"]["windowUntil"], "2026-09-25T00:00:00Z")
 
     def test_bridge_malformed_output_never_counts_as_success(self):
         for code in (0, 1):

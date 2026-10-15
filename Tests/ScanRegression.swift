@@ -29,6 +29,7 @@ final class FakeMail {
   var failAccounts = false
   var failMetadata = false
   var failBody = false
+  var timeoutBodies: Set<Int> = []
   var bodies: [Int: String] = [:]
   var renderedBodies: [Int: String] = [:]
   var renderedReads: [Int] = []
@@ -59,7 +60,10 @@ final class FakeMail {
     if source.contains("return source of targetMessage") {
       let id = number(#"whose id is (\d+)"#, source)
       previews.append(id)
-      if failBody { throw MailBridgeError.mailAutomation("synthetic body timeout") }
+      if failBody { throw MailBridgeError.mailAutomation("synthetic body script error") }
+      if timeoutBodies.contains(id) {
+        throw MailBridgeError.diagnosedAutomation("synthetic", ["reason": "apple_event_timeout", "operation": "source"])
+      }
       if let body = bodies[id] { return .init(string: body) }
       return .init(string: "Content-Type: text/plain; charset=utf-8\r\n\r\nPlease submit by Friday. Your verification code: 123456")
     }
@@ -428,4 +432,49 @@ try scenario("deadline-diagnostics-preserve-operation") { store, mail, service i
     expect(error.diagnostics?["operation"] == "metadata", "Lost failing stage")
   }
 }
+try scenario("body-timeout-defers-mail-without-failing-scan") { store, mail, service in
+  mail.rows = [row(1, date: "2026-08-19T08:00:00Z"), row(2, date: "2026-08-20T08:00:00Z"), row(3, date: "2026-08-21T08:00:00Z")]
+  mail.timeoutBodies = [1]
+  let response = try service.handle(scan())
+  expect(response.ok && response.status == "partial" && response.messages?.count == 3, "A slow body failed the whole scan")
+  expect(response.messages!.allSatisfy { $0.bodyReadError == "body_timeout" }, "Bodies after a timeout were not deferred")
+  expect(mail.previews == [1], "Scan kept waiting on a stalled Mail after one body timeout")
+  expect(try! store.summary().deferredBodyCount == 3, "Timed-out bodies were not retained as unread")
+  mail.timeoutBodies = []
+  let read = try service.handle({ var request = BridgeRequest(action: "message.read"); request.ref = response.messages![0].ref; return request }())
+  expect(read.messages?.first?.bodyReadError == nil, "Recovered body stayed deferred")
+  mail.timeoutBodies = [2]
+  var timedOutRead = BridgeRequest(action: "message.read")
+  timedOutRead.ref = response.messages!.first { $0.ref.libraryId == 2 }!.ref
+  let timedOut = try service.handle(timedOutRead)
+  expect(timedOut.messages?.first?.bodyReadError == "body_timeout", "Timed-out read was not a content limitation")
+  mail.timeoutBodies = []
+  let reread = try service.handle(scan())
+  expect(reread.messages?.allSatisfy { $0.bodyReadError == nil } == true, "Deferred mail was not reread")
+  expect(try! store.summary().deferredBodyCount == 0, "Reread did not clear deferred bodies")
+}
+
+try scenario("window-until-advances-quiet-accounts") { store, mail, service in
+  mail.accounts = [("active", true), ("quiet", true), ("blocked", true), ("disabled", false)]
+  try record(store, ["cursors": [
+    ["accountId": "active", "receivedAt": "2026-08-10T00:00:00Z"],
+    ["accountId": "quiet", "receivedAt": "2026-08-01T00:00:00Z"],
+    ["accountId": "blocked", "receivedAt": "2026-08-01T00:00:00Z"],
+    ["accountId": "disabled", "receivedAt": "2026-08-01T00:00:00Z"]]])
+  mail.rows = [row(5, account: "blocked", date: "2026-08-05T00:00:00Z")]
+  mail.bodies[5] = "Content-Type: multipart/mixed; boundary=missing\n\nBroken MIME"
+  _ = try service.handle(scan())
+  func save(_ state: [String: Any]) throws {
+    let data = try JSONSerialization.data(withJSONObject: ["action": "state.record", "state": state])
+    _ = try service.handle(JSONDecoder().decode(BridgeRequest.self, from: data))
+  }
+  mustFail { try save(["windowUntil": DateCodec.string(Date().addingTimeInterval(3600))]) }
+  try save(["windowUntil": "2026-08-31T23:59:59Z"])
+  let cursors = Dictionary(uniqueKeysWithValues: try store.summary().cursors.map { ($0.accountId, $0.receivedAt) })
+  expect(cursors["active"] == "2026-08-31T23:59:59.000Z" && cursors["quiet"] == "2026-08-31T23:59:59.000Z", "Quiet account still anchors the window")
+  expect(DateCodec.date(cursors["blocked"]!)! < DateCodec.date("2026-08-05T00:00:00Z")!, "Window advance skipped unread mail")
+  expect(cursors["disabled"] == "2026-08-01T00:00:00Z", "Disabled account cursor moved")
+  expect(cursors.count == 4, "Window advance created cursors for unseen accounts")
+}
+
 print("Mail scan/cache: \(checkCount) synthetic scenarios passed; no Apple Mail access")

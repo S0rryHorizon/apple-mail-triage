@@ -233,6 +233,8 @@ public struct StateUpdate: Codable, Sendable {
   public var processed: [ProcessedRecord]?
   public var candidates: [CandidateRecord]?
   public var cursors: [CursorRecord]?
+  /// `until` of the fully paginated scan window this record closes.
+  public var windowUntil: String?
 }
 
 public struct BridgeRequest: Codable, Sendable {

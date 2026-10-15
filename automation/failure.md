@@ -1,6 +1,6 @@
 # Returned failure handling
 
-Automatic repair is a fallback for operational failures that block mailbox work. It does not apply to chat cleanup, individual unreadable content, attachment conversion/policy limits, invalid request fields, missing user details, permissions requiring user action, a fully hung/no-result call, or calendar writes. Report unknown outcomes without replaying them. Never resume a user-paused schedule.
+Automatic repair is a fallback for operational failures that block mailbox work. It does not apply to chat cleanup, individual unreadable content, attachment conversion/policy limits, invalid request fields, missing user details, permissions requiring user action, a repeated Apple Mail timeout (`mail_timeout`; the next slot rescans the unchanged window), a fully hung/no-result call, or calendar writes. Report unknown outcomes without replaying them. Never resume a user-paused schedule.
 
 Background MailBridge calls use `bridge.call`: it parses error JSON even on nonzero exit, preserves `errorCode`, closes the run and returns an already-registered `recovery` result. Reuse that result instead of calling `incident.open` again. Correct a rejected request in the existing task; report genuine user-action blockers there. Body/content limitations use the partial procedure. The runtime enforces exclusions in incident creation and every automatic launch path.
 
