@@ -26,6 +26,21 @@ class RuntimeTests(unittest.TestCase):
         self.runtime = module.Runtime(self.directory, self.settings)
         module.atomic_json(self.runtime.registry_path, self.registry)
         self.call("initialize")
+        environment = patch.dict(os.environ, {"CODEX_HOME": str(self.base / "codex-home")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.session(self.dispatcher)
+
+    def session(self, thread, source="automation", automation="apple", archived=False):
+        """Synthetic Codex session metadata; only the fields the runtime reads."""
+        folder = self.base / "codex-home" / ("archived_sessions" if archived else "sessions/2026/10/16")
+        folder.mkdir(parents=True, exist_ok=True)
+        lines = [{"type": "session_meta", "payload": {"id": thread, "thread_source": source}},
+                 {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                     {"type": "input_text", "text": f"Automation: 分发器\nAutomation ID: {automation}\nLast run: x\n\n分发"}]}}]
+        (folder / f"rollout-2026-10-16T07-55-41-{thread}.jsonl").write_text(
+            "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n")
+        return thread
 
     def call(self, action, **args):
         return self.runtime.handle({"action": action, "thread_id": self.dispatcher, **args})
@@ -310,7 +325,7 @@ class RuntimeTests(unittest.TestCase):
                               thread_id=uid(), manual=True, confirmed=True)
 
     def cleanup_failure(self):
-        self.cleanup_target = uid()
+        self.cleanup_target = self.session(uid())
         state = self.runtime.state()
         state["runs"]["apple:2026-09-24T20:00:00+08:00"] = {
             **state["runs"][self.run_id], "dispatcher_id": self.cleanup_target,
@@ -388,6 +403,74 @@ class RuntimeTests(unittest.TestCase):
         delayed = self.call("dispatch.plan", thread_id=uid(), now="2026-10-16T11:30:00+08:00")
         self.assertEqual(delayed["operation"], "already_registered")
         self.assertEqual(sum(key.startswith("apple:2026-10-16") for key in self.runtime.state()["runs"]), 1)
+
+    def finished_slot(self):
+        plan = self.call("dispatch.plan", now="2026-10-16T19:55:45+08:00")
+        self.call("triage.begin", run_id=plan["run_id"], thread_id=self.worker)
+        self.call("triage.recorded", run_id=plan["run_id"], thread_id=self.worker, state_recorded=True)
+        return plan
+
+    def test_repeat_trigger_of_finished_slot_self_archives_only_itself(self):
+        plan = self.finished_slot()
+        repeat = self.session(uid())
+        result = self.call("dispatch.plan", thread_id=repeat, now="2026-10-16T20:00:30+08:00")
+        self.assertEqual((result["operation"], result["delivered"], result["self_archive"]),
+                         ("already_registered", False, True))
+        self.assertEqual(result["run"]["dispatcher_id"], self.dispatcher)
+        self.assertEqual(self.call("cleanup.record", target_thread_id=repeat), {"archived": repeat})
+        archived = self.runtime.state()["archived"]
+        self.assertIn(repeat, archived)
+        self.assertNotIn(self.worker, archived)
+        self.assertEqual(self.runtime.state()["runs"][plan["run_id"]]["dispatcher_id"], self.dispatcher)
+
+    def test_unacknowledged_self_archive_is_retried_by_next_dispatcher(self):
+        self.finished_slot()
+        repeat = self.session(uid())
+        self.assertTrue(self.call("dispatch.plan", thread_id=repeat, now="2026-10-16T20:00:30+08:00")["self_archive"])
+        following = self.call("dispatch.plan", thread_id=self.session(uid()), now="2026-10-17T08:05:00+08:00")
+        self.call("dispatch.delivered", run_id=following["run_id"])
+        cleanup = self.call("cleanup.plan", run_id=following["run_id"], thread_id=uid())
+        self.assertIn(repeat, cleanup["thread_ids"])
+        self.assertNotIn(self.worker, cleanup["thread_ids"])
+
+    def test_unfinished_slots_keep_repeat_dispatcher_visible(self):
+        for phase in ("prepared", "delivered", "running", "failed", "blocked", "unknown"):
+            with self.subTest(phase=phase):
+                self.setUp()
+                plan = self.call("dispatch.plan", now="2026-10-16T19:55:45+08:00")
+                state = self.runtime.state()
+                state["runs"][plan["run_id"]]["phase"] = phase
+                self.runtime.save(state)
+                repeat = self.session(uid())
+                result = self.call("dispatch.plan", thread_id=repeat, now="2026-10-16T20:00:30+08:00")
+                self.assertEqual((result["self_archive"], result["reason"]), (False, "run_not_finished"))
+                self.assertNotIn("skipped_dispatchers", self.runtime.state())
+                with self.assertRaises(ValueError):
+                    self.call("cleanup.record", target_thread_id=repeat)
+
+    def test_only_scheduled_threads_of_this_automation_are_disposable(self):
+        manual = self.session(uid(), source="user")
+        weekly = self.session(self.worker, source="agent_forked_thread")
+        other = self.session(uid(), automation="another")
+        archived = self.session(uid(), archived=True)
+        missing = uid()
+        for thread in (manual, weekly, other, missing):
+            with self.subTest(thread=thread):
+                self.assertFalse(module.automation_thread(thread, "apple"))
+        self.assertTrue(module.automation_thread(archived, "apple"))
+        # A manual chat that dispatched a slot stays out of cleanup.
+        plan = self.call("dispatch.plan", thread_id=manual, now="2026-10-16T12:31:24+08:00")
+        self.call("triage.begin", run_id=plan["run_id"], thread_id=self.worker)
+        self.call("triage.recorded", run_id=plan["run_id"], thread_id=self.worker, state_recorded=True)
+        result = self.call("dispatch.plan", thread_id=manual, now="2026-10-16T12:40:00+08:00")
+        self.assertEqual((result["self_archive"], result["reason"]), (False, "not_scheduled_dispatcher"))
+        result = self.call("dispatch.plan", thread_id=weekly, now="2026-10-16T12:40:00+08:00")
+        self.assertFalse(result["self_archive"])
+        evening = self.call("dispatch.plan", now="2026-10-16T20:01:00+08:00")
+        self.call("dispatch.delivered", run_id=evening["run_id"])
+        cleanup = self.call("cleanup.plan", run_id=evening["run_id"], thread_id=self.dispatcher)
+        self.assertNotIn(manual, cleanup["thread_ids"])
+        self.assertNotIn(self.worker, cleanup["thread_ids"])
 
     def test_restarted_dispatcher_is_eligible_for_cleanup_after_new_run(self):
         self.start()

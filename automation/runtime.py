@@ -92,6 +92,7 @@ def repair_exclusion(incident):
 def known_threads(state, registry):
     ids = {item["threadId"] for item in registry["managedThreads"].values()}
     ids.update(item["dispatcher_id"] for item in state["runs"].values())
+    ids.update(state.get("skipped_dispatchers", {}))
     for incident in state["incidents"].values():
         ids.update(incident.get("failed_thread_ids", [incident["failed_thread_id"]]))
         if incident.get("repair_thread_id"):
@@ -101,6 +102,35 @@ def known_threads(state, registry):
         if incident.get("previous_week_thread_id"):
             ids.add(incident["previous_week_thread_id"])
     return ids
+
+
+def automation_thread(thread, automation_id):
+    """True only when Codex itself recorded the thread as a scheduled run of this automation.
+
+    Session metadata is written by Codex, not by the model, so a manual chat
+    that called dispatch.plan, a weekly task or a repair task never matches.
+    A missing or unreadable session is not proof either way and returns False.
+    """
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    pattern = f"rollout-*-{thread}.jsonl"
+    path = next(iter([*home.glob(f"sessions/*/*/*/{pattern}"), *home.glob(f"archived_sessions/{pattern}")]), None)
+    if path is None:
+        return False
+    marker = f"Automation ID: {automation_id}"
+    try:
+        with path.open() as session:
+            meta = json.loads(session.readline()).get("payload", {})
+            if meta.get("id") != thread or meta.get("thread_source") != "automation":
+                return False
+            for _, line in zip(range(200), session):
+                payload = json.loads(line).get("payload", {})
+                if payload.get("type") == "message" and payload.get("role") == "user":
+                    text = "".join(part.get("text", "") for part in payload.get("content", []))
+                    if text.startswith("Automation:") and marker in text.splitlines():
+                        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+    return False
 
 
 def cleanup_outcome(state, target):
@@ -376,10 +406,24 @@ class Runtime:
                         planned -= dt.timedelta(hours=12)
                 week, title = week_info(planned)
                 run_id = registry["automationId"] + ":" + planned.isoformat()
-                if run_id in state["runs"]:
-                    return {"operation": "already_registered", "run_id": run_id, "planned_at": planned.isoformat(),
-                            "delivered": False, "run": state["runs"][run_id]}
                 owner = thread_id(request["thread_id"])
+                if run_id in state["runs"]:
+                    run = state["runs"][run_id]
+                    result = {"operation": "already_registered", "run_id": run_id, "planned_at": planned.isoformat(),
+                              "delivered": False, "run": run, "self_archive": False}
+                    # A repeated trigger of a finished slot leaves nothing to inspect, so its
+                    # own scheduled dispatcher may archive itself. Unfinished, failed or unknown
+                    # runs stay visible, and only a verified scheduled thread qualifies.
+                    if run["phase"] not in ("recorded", "completed", "partial"):
+                        result["reason"] = "run_not_finished"
+                    elif not automation_thread(owner, registry["automationId"]):
+                        result["reason"] = "not_scheduled_dispatcher"
+                    else:
+                        state.setdefault("skipped_dispatchers", {})[owner] = {
+                            "run_id": run_id, "at": now.isoformat()}
+                        self.save(state)
+                        result["self_archive"] = True
+                    return result
                 target = registry["managedThreads"].get(week)
                 if target and target.get("setupState", "ready") != "ready":
                     raise ValueError("本周任务创建未完成，需恢复原任务，不能另建副本")
@@ -450,8 +494,13 @@ class Runtime:
                 run = state["runs"][request["run_id"]]
                 previous = week_info(timestamp(run["planned_at"]) - dt.timedelta(days=7))[0]
                 ids = [item["threadId"] for week, item in registry["managedThreads"].items() if week < previous]
-                ids += [item["dispatcher_id"] for item in state["runs"].values()
-                        if item["phase"] in ("delivered", "running", "partial", "recorded", "completed")]
+                dispatchers = {item["dispatcher_id"] for item in state["runs"].values()
+                               if item["phase"] in ("delivered", "running", "partial", "recorded", "completed")}
+                dispatchers.update(state.get("skipped_dispatchers", {}))
+                # Only scheduled dispatcher threads are disposable; a manual chat that
+                # ran dispatch.plan keeps its conversation.
+                ids += [value for value in dispatchers - set(state["archived"])
+                        if automation_thread(value, registry["automationId"])]
                 ids += [item["repair_thread_id"] for item in state["incidents"].values()
                         if item["status"] == "resolved" and item.get("repair_archive_pending")
                         and item.get("repair_thread_id")]
