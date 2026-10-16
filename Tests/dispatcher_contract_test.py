@@ -350,6 +350,45 @@ class RuntimeTests(unittest.TestCase):
                             planned_at="2026-12-27T20:00:00+08:00")
         self.assertEqual(delayed["week"], "2026-W52")
 
+    def test_slot_selection_tolerates_bounded_early_start(self):
+        cases = [  # now (Asia/Singapore), expected slot, week, early_start
+            ("2026-10-16T07:44:59", "2026-10-15T20:00", "2026-W42", False),
+            ("2026-10-16T07:45:00", "2026-10-16T08:00", "2026-W42", True),
+            ("2026-10-16T07:55:41", "2026-10-16T08:00", "2026-W42", True),
+            ("2026-10-16T08:00:00", "2026-10-16T08:00", "2026-W42", False),
+            ("2026-10-16T10:57:06", "2026-10-16T08:00", "2026-W42", False),
+            ("2026-10-16T19:44:59", "2026-10-16T08:00", "2026-W42", False),
+            ("2026-10-16T19:55:45", "2026-10-16T20:00", "2026-W42", True),
+            ("2026-10-16T23:59:00", "2026-10-16T20:00", "2026-W42", False),
+            ("2026-10-17T00:31:54", "2026-10-16T20:00", "2026-W42", False),
+            ("2026-10-18T19:56:00", "2026-10-18T20:00", "2026-W42", True),
+            ("2026-10-19T07:56:00", "2026-10-19T08:00", "2026-W43", True),
+            ("2026-12-31T19:56:00", "2026-12-31T20:00", "2026-W53", True),
+            ("2027-01-04T07:55:00", "2027-01-04T08:00", "2027-W01", True),
+        ]
+        for now, slot, week, early in cases:
+            with self.subTest(now=now):
+                self.setUp()
+                plan = self.call("dispatch.plan", now=now + "+08:00")
+                self.assertEqual(plan["planned_at"], slot + ":00+08:00")
+                self.assertEqual((plan["week"], plan["early_start"]), (week, early))
+
+    def test_early_start_after_recorded_slot_delivers_once(self):
+        # 2026-10-16: previous evening recorded, scheduler started at 07:55:41.
+        evening = self.call("dispatch.plan", now="2026-10-15T20:16:36+08:00")
+        self.call("triage.begin", run_id=evening["run_id"], thread_id=self.worker)
+        self.call("triage.recorded", run_id=evening["run_id"], thread_id=self.worker, state_recorded=True)
+        early = self.call("dispatch.plan", now="2026-10-16T07:55:41+08:00")
+        self.assertEqual((early["operation"], early["thread_id"]), ("deliver", self.worker))
+        self.assertEqual(early["run_id"], "apple:2026-10-16T08:00:00+08:00")
+        self.assertTrue(early["early_start"])
+        on_time = self.call("dispatch.plan", thread_id=uid(), now="2026-10-16T08:00:30+08:00")
+        self.assertEqual((on_time["operation"], on_time["run_id"], on_time["delivered"]),
+                         ("already_registered", early["run_id"], False))
+        delayed = self.call("dispatch.plan", thread_id=uid(), now="2026-10-16T11:30:00+08:00")
+        self.assertEqual(delayed["operation"], "already_registered")
+        self.assertEqual(sum(key.startswith("apple:2026-10-16") for key in self.runtime.state()["runs"]), 1)
+
     def test_restarted_dispatcher_is_eligible_for_cleanup_after_new_run(self):
         self.start()
         self.call("triage.recorded", run_id=self.run_id, thread_id=self.worker, state_recorded=True)

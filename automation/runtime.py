@@ -29,6 +29,9 @@ NON_REPAIR_CODES = {
     "attachment_conversion_failed", "source_size_limit", "mail_body_size_limit",
     "body_decode_failed", "body_not_read", "source_body_missing", "body_timeout", "mail_timeout",
 }
+# The scheduler supplies no planned time and has repeatedly started ~4 minutes
+# before 08:00/20:00. Within this bound a run belongs to the upcoming slot.
+EARLY_START = dt.timedelta(minutes=15)
 TIMEOUT_REASONS = {"apple_event_timeout", "scan_deadline"}
 TIMEOUT_RETRY_ACTIONS = {"message.scan", "message.read"}
 TIMEOUT_RETRY_PAUSE = 10
@@ -367,13 +370,15 @@ class Runtime:
                 if request.get("planned_at"):
                     planned = timestamp(request["planned_at"])
                 else:
-                    planned = now.replace(hour=20 if now.hour >= 20 else 8, minute=0, second=0, microsecond=0)
-                    if now.hour < 8:
+                    shifted = now + EARLY_START
+                    planned = shifted.replace(hour=20 if shifted.hour >= 20 else 8, minute=0, second=0, microsecond=0)
+                    if shifted.hour < 8:
                         planned -= dt.timedelta(hours=12)
                 week, title = week_info(planned)
                 run_id = registry["automationId"] + ":" + planned.isoformat()
                 if run_id in state["runs"]:
-                    return {"operation": "already_registered", "run_id": run_id, "run": state["runs"][run_id]}
+                    return {"operation": "already_registered", "run_id": run_id, "planned_at": planned.isoformat(),
+                            "delivered": False, "run": state["runs"][run_id]}
                 owner = thread_id(request["thread_id"])
                 target = registry["managedThreads"].get(week)
                 if target and target.get("setupState", "ready") != "ready":
@@ -387,8 +392,8 @@ class Runtime:
                     "thread_id": target["threadId"] if target else None, "phase": "prepared", "retries": 0}
                 self.save(state)
                 role = self.config()["roles"]["triage"]
-                result = {"run_id": run_id, "week": week, "title": title,
-                          "operation": "deliver" if target else "fork",
+                result = {"run_id": run_id, "week": week, "title": title, "planned_at": planned.isoformat(),
+                          "early_start": planned > now, "operation": "deliver" if target else "fork",
                           "model": role["model"], "thinking": role["reasoning_effort"], "prompt": self.prompt(run_id)}
                 if target:
                     result["thread_id"] = target["threadId"]
