@@ -1,5 +1,5 @@
 """Synthetic dispatch/recovery behavior tests; no Mail or live Codex access."""
-import concurrent.futures, importlib.util, json, os, subprocess, tempfile, unittest, uuid
+import concurrent.futures, importlib.util, json, os, sqlite3, subprocess, tempfile, unittest, uuid
 from pathlib import Path
 from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
@@ -403,6 +403,58 @@ class RuntimeTests(unittest.TestCase):
         delayed = self.call("dispatch.plan", thread_id=uid(), now="2026-10-16T11:30:00+08:00")
         self.assertEqual(delayed["operation"], "already_registered")
         self.assertEqual(sum(key.startswith("apple:2026-10-16") for key in self.runtime.state()["runs"]), 1)
+
+    def codex_archive(self, thread, index=True, files=True):
+        """Mirror what Codex records when it archives a chat: index flag and moved rollout."""
+        home = self.base / "codex-home"
+        if files:
+            for path in list(home.glob(f"sessions/*/*/*/rollout-*-{thread}.jsonl")):
+                (home / "archived_sessions").mkdir(parents=True, exist_ok=True)
+                path.rename(home / "archived_sessions" / path.name)
+        with sqlite3.connect(home / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, archived INTEGER, archived_at INTEGER)")
+            db.execute("INSERT OR REPLACE INTO threads VALUES (?, ?, ?)",
+                       (thread, 1 if index else 0, 1792125788 if index else None))
+
+    def lost_ack_dispatcher(self):
+        self.finished_slot()
+        repeat = self.session(uid())
+        self.assertTrue(self.call("dispatch.plan", thread_id=repeat, now="2026-10-16T20:00:30+08:00")["self_archive"])
+        following = self.call("dispatch.plan", thread_id=self.session(uid()), now="2026-10-17T08:05:00+08:00")
+        self.call("dispatch.delivered", run_id=following["run_id"])
+        return repeat, following["run_id"]
+
+    def test_confirmed_self_archive_is_recorded_without_rearchiving(self):
+        repeat, run_id = self.lost_ack_dispatcher()
+        self.codex_archive(repeat)
+        cleanup = self.call("cleanup.plan", run_id=run_id, thread_id=uid())
+        self.assertNotIn(repeat, cleanup["thread_ids"])
+        self.assertEqual(cleanup["confirmed_archived"], [repeat])
+        self.assertIn(repeat, self.runtime.state()["archived"])
+        self.assertEqual(self.call("cleanup.plan", run_id=run_id, thread_id=uid())["confirmed_archived"], [])
+
+    def test_partial_archive_evidence_is_not_recorded(self):
+        for index, files in ((True, False), (False, True), (None, True)):
+            with self.subTest(index=index, files=files):
+                self.setUp()
+                repeat, run_id = self.lost_ack_dispatcher()
+                if index is None:
+                    (self.base / "codex-home" / "archived_sessions").mkdir(parents=True, exist_ok=True)
+                    for path in list((self.base / "codex-home").glob(f"sessions/*/*/*/rollout-*-{repeat}.jsonl")):
+                        path.rename(self.base / "codex-home" / "archived_sessions" / path.name)
+                else:
+                    self.codex_archive(repeat, index=index, files=files)
+                cleanup = self.call("cleanup.plan", run_id=run_id, thread_id=uid())
+                self.assertIn(repeat, cleanup["thread_ids"])
+                self.assertNotIn(repeat, self.runtime.state()["archived"])
+
+    def test_blocked_target_is_not_reconciled_from_codex_archive(self):
+        self.start()
+        self.cleanup_failure()
+        self.codex_archive(self.cleanup_target)
+        result = self.call("cleanup.plan", run_id=self.run_id)
+        self.assertEqual(result["blocked_thread_ids"], [self.cleanup_target])
+        self.assertNotIn(self.cleanup_target, self.runtime.state()["archived"])
 
     def finished_slot(self):
         plan = self.call("dispatch.plan", now="2026-10-16T19:55:45+08:00")

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,35 @@ def known_threads(state, registry):
     return ids
 
 
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def codex_archived(thread):
+    """True only when Codex's task index and its session files both show the thread archived.
+
+    A self-archive ends the archiving turn before it can acknowledge itself, so
+    later dispatchers reconcile from Codex's own records. Read-only; any missing,
+    unreadable or disagreeing source leaves the thread unconfirmed.
+    """
+    home = codex_home()
+    pattern = f"rollout-*-{thread}.jsonl*"
+    if not [*home.glob(f"archived_sessions/{pattern}")] or [*home.glob(f"sessions/*/*/*/{pattern}")]:
+        return False
+    indexes = sorted(home.glob("state_*.sqlite"), key=lambda path: int(re.sub(r"\D", "", path.stem) or 0))
+    if not indexes:
+        return False
+    try:
+        connection = sqlite3.connect(f"{indexes[-1].as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            row = connection.execute("SELECT archived, archived_at FROM threads WHERE id = ?", (thread,)).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0] == 1 and row[1])
+
+
 def automation_thread(thread, automation_id):
     """True only when Codex itself recorded the thread as a scheduled run of this automation.
 
@@ -111,7 +141,7 @@ def automation_thread(thread, automation_id):
     that called dispatch.plan, a weekly task or a repair task never matches.
     A missing or unreadable session is not proof either way and returns False.
     """
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    home = codex_home()
     pattern = f"rollout-*-{thread}.jsonl"
     path = next(iter([*home.glob(f"sessions/*/*/*/{pattern}"), *home.glob(f"archived_sessions/{pattern}")]), None)
     if path is None:
@@ -131,6 +161,14 @@ def automation_thread(thread, automation_id):
     except (OSError, ValueError, AttributeError):
         return False
     return False
+
+
+def mark_archived(state, owner):
+    state["archived"] = sorted(set(state["archived"]) | {owner})
+    state.get("missing_threads", {}).pop(owner, None)
+    for incident in state["incidents"].values():
+        if incident.get("repair_thread_id") == owner:
+            incident.pop("repair_archive_pending", None)
 
 
 def cleanup_outcome(state, target):
@@ -526,19 +564,24 @@ class Runtime:
                         if incident.get("previous_week_thread_id"):
                             protected.add(incident["previous_week_thread_id"])
                 remaining = set(ids) - set(state["archived"]) - set(state.get("missing_threads", {}))
+                # Record archives Codex already confirms (typically a self-archive whose
+                # turn ended before cleanup.record) instead of archiving them again.
+                # Blocked targets keep their incident procedure.
+                confirmed = sorted(value for value in remaining - blocked if codex_archived(value))
+                for value in confirmed:
+                    mark_archived(state, value)
+                if confirmed:
+                    self.save(state)
+                remaining -= set(confirmed)
                 return {"thread_ids": sorted(remaining - protected - blocked - {request["thread_id"]}),
-                        "blocked_thread_ids": sorted(remaining & blocked)}
+                        "blocked_thread_ids": sorted(remaining & blocked), "confirmed_archived": confirmed}
             if action == "cleanup.record":
                 owner = thread_id(request.get("target_thread_id") or request["thread_id"])
                 if owner not in known_threads(state, registry):
                     raise ValueError("不管理未知任务")
                 outcome = request.get("outcome", "archived")
                 if outcome == "archived":
-                    state["archived"] = sorted(set(state["archived"]) | {owner})
-                    state.get("missing_threads", {}).pop(owner, None)
-                    for incident in state["incidents"].values():
-                        if incident.get("repair_thread_id") == owner:
-                            incident.pop("repair_archive_pending", None)
+                    mark_archived(state, owner)
                 elif outcome == "missing":
                     incident = state["incidents"][request["incident_id"]]
                     # The caller must verify both local sources. An App lookup
