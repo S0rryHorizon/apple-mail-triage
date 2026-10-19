@@ -22,5 +22,14 @@ jobs:
         run: swift run MailBridgeSyntheticDemo
       - name: Dispatcher contract tests
         run: python3 -m unittest Tests/dispatcher_contract_test.py
+      - name: Set up attachment converter Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install synthetic attachment test dependencies
+        run: |
+          python -m venv "${RUNNER_TEMP}/mail-converter"
+          "${RUNNER_TEMP}/mail-converter/bin/python" -m pip install 'markitdown[pdf,docx,xlsx]==0.1.8'
+          echo "MAIL_TRIAGE_CONVERTER_PYTHON=${RUNNER_TEMP}/mail-converter/bin/python" >> "$GITHUB_ENV"
       - name: Scan regression and lock contention tests
         run: python3 -m unittest Tests/scan_test.py
